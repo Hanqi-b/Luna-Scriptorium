@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.codex/translate-book-guard/
+.artifacts/
