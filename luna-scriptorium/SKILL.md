@@ -1,5 +1,5 @@
 ---
-name: translate-book
+name: luna-scriptorium
 description: Translate a book from verified UTF-8 Markdown with four supervised GPT-6 Luna Max Codex subagents and resumable state. If the original is EPUB, PDF, or another format, first help prepare faithful Markdown or ask the user to provide it; the translation runner accepts Markdown/TXT and outputs Markdown.
 ---
 
@@ -17,7 +17,7 @@ After the Markdown is ready, run the runner's read-only `plan SOURCE --chunking-
 
 Run `init` for a new project with `--chunking-version 2`, `--expected-source-sha256`, and `--expected-plan-sha256` from that plan. Set known languages explicitly, for example `--source-language fr --target-language zh-CN`. `init` copies and hashes the agreed Markdown and persists the ordered chunks in SQLite. Treat this as the lock: do not change the source or repartition an initialized project. If the hash comparison fails, return to Stage 1 and plan again. `start` verifies the locked plan before workers are dispatched. Stage 2 contains **all** chapter/chunk decisions; workers never choose their own boundaries.
 
-Run the CLI from the repository root as `python3 translate-book/translate_book.py ...`. The plan is noninteractive; pass its two SHA-256 values to `init` automatically. Version 1 remains available only to reproduce old paragraph-level plans; new projects use version 2.
+Run the CLI from the repository root as `python3 luna-scriptorium/translate_book.py ...`. The plan is noninteractive; pass its two SHA-256 values to `init` automatically. Version 1 remains available only to reproduce old paragraph-level plans; new projects use version 2.
 
 ## Authorization and pool
 

@@ -57,7 +57,7 @@ There is no exposed task-scoped SIGKILL operation for a Desktop root. The Deskto
 
 ## Automated verification
 
-`python3 -m unittest discover -s tests -p 'test_runner.py' -q`: **41 passed**. Coverage includes guarded start and warmup requirements, additive migration, exact root/run fencing, Stop and Interrupt hook subprocesses, both Interrupt/start races, the Stop/start race, different-cwd worker fencing for check-run/claim/commit/fail, malformed hook cwd, stale mappings, one active guarded pool per root, mapping tampering, STOP/commit serialization, cleanup gating, attempt deadlines, failure isolation, repeated resume, and the new chunk-plan checks. `py_compile` passed for the runner and hook. `quick_validate.py translate-book` reported `Skill is valid!`.
+`python3 -m unittest discover -s tests -p 'test_runner.py' -q`: **41 passed**. Coverage includes guarded start and warmup requirements, additive migration, exact root/run fencing, Stop and Interrupt hook subprocesses, both Interrupt/start races, the Stop/start race, different-cwd worker fencing for check-run/claim/commit/fail, malformed hook cwd, stale mappings, one active guarded pool per root, mapping tampering, STOP/commit serialization, cleanup gating, attempt deadlines, failure isolation, repeated resume, and the new chunk-plan checks. `py_compile` passed for the runner and hook. `quick_validate.py luna-scriptorium` reported `Skill is valid!`.
 
 ## Source preparation and deterministic chunking
 

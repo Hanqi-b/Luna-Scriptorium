@@ -18,8 +18,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNNER = ROOT / "translate-book" / "translate_book.py"
-ROOT_GUARD_HOOK = ROOT / "translate-book" / "hooks" / "root_guard.py"
+RUNNER = ROOT / "luna-scriptorium" / "translate_book.py"
+ROOT_GUARD_HOOK = ROOT / "luna-scriptorium" / "hooks" / "root_guard.py"
 
 
 class RunnerCLITests(unittest.TestCase):
