@@ -4,7 +4,7 @@ Date: 2026-09-24. The lifecycle gate is **PASS for normal Codex Stop and Interru
 
 ## What changed
 
-- A guarded `start` binds each run to the root Codex thread. It requires a `SessionStart` marker and a marker from an earlier successful root `Stop` hook in the same session. The root must finish one harmless warmup turn before starting a guarded run.
+- A guarded `start` binds each run to the root Codex thread. `SessionStart` and `Stop` readiness markers are optional observations, not authorization or startup requirements. A new project can start with neither marker present.
 - The runner publishes the run mapping before it can commit `RUNNING`. A per-session file lock serializes that publication and the SQLite transaction with the hook's scan. One root can have only one active guarded translation run.
 - Project `Stop` and `Interrupt` hooks call `stop-for-root`. Its `BEGIN IMMEDIATE` transaction compares the exact current `run_id` and `root_thread_id`, changes the run to `STOPPED`, interrupts unfinished attempts, and clears the current run. Old or mismatched mappings cannot stop a newer run. The hook derives the runner executable from its own trusted path, not from writable mapping data.
 - Both `Stop` and `Interrupt` append and sync a durable per-session cancellation epoch before waiting for the start/stop lock. `Interrupt` also publishes a temporary tombstone. Guarded `start` snapshots the epoch at command entry and checks it through transaction commit and after releasing the lock. A late cancellation stops a committed new run before `start` returns. The run stores its root guard directory and epoch, so guarded claim and commit check the same source even from another working directory. A successful `Stop` clears the temporary tombstone; the durable epoch remains to cancel an already-running `start`. This closes the reproduced pre-mapping and lock-timeout races.
@@ -57,7 +57,7 @@ There is no exposed task-scoped SIGKILL operation for a Desktop root. The Deskto
 
 ## Automated verification
 
-`python3 -m unittest discover -s tests -p 'test_runner.py' -q`: **41 passed**. Coverage includes guarded start and warmup requirements, additive migration, exact root/run fencing, Stop and Interrupt hook subprocesses, both Interrupt/start races, the Stop/start race, different-cwd worker fencing for check-run/claim/commit/fail, malformed hook cwd, stale mappings, one active guarded pool per root, mapping tampering, STOP/commit serialization, cleanup gating, attempt deadlines, failure isolation, repeated resume, and the new chunk-plan checks. `py_compile` passed for the runner and hook. `quick_validate.py luna-scriptorium` reported `Skill is valid!`.
+`python3 -m unittest discover -s tests -p 'test_runner.py' -q`: **42 passed**. Coverage includes start without either lifecycle marker reaching the four-worker pool, optional and malformed marker behavior, additive migration, exact root/run fencing, Stop and Interrupt hook subprocesses, both Interrupt/start races, the Stop/start race, different-cwd worker fencing for check-run/claim/commit/fail, malformed hook cwd, stale mappings, one active guarded pool per root, mapping tampering, STOP/commit serialization, cleanup gating, attempt deadlines, failure isolation, repeated resume, and the chunk-plan checks. `py_compile` passed for the runner and hook. `quick_validate.py luna-scriptorium` reported `Skill is valid!`.
 
 ## Source preparation and deterministic chunking
 

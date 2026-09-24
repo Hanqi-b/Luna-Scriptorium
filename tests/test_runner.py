@@ -1212,38 +1212,53 @@ class RunnerCLITests(unittest.TestCase):
         self.assertTrue(resumed["claimed"], resumed)
         self.assertEqual(resumed["attempt_number"], 2)
 
-    def test_guarded_start_requires_ready_marker_for_current_root(self) -> None:
-        self.init_text("Guarded start requires the installed Stop hook to be ready.")
-        root_id = "root-ready-required"
+    def test_start_without_any_lifecycle_markers_reaches_four_worker_pool(self) -> None:
+        self.init_text("A new translation can start without Desktop lifecycle hooks.")
+        root_id = "root-no-hook-markers"
 
-        result = self.invoke(
+        started = self.command(
             "start",
             self.project,
             cwd=self.temp_root,
             env_overrides=self.root_env(root_id, root_id),
         )
+        self.assertEqual(started["status"], "RUNNING")
+        self.assertEqual(started["root_thread_id"], root_id)
+        self.assertEqual(started["worker_paths"], {
+            f"translator_{number}": f"/root/translator_{number}" for number in range(1, 5)
+        })
+        self.assertFalse((self.temp_root / ".codex" / "translate-book-guard" / "ready").exists())
+        self.assertFalse((self.temp_root / ".codex" / "translate-book-guard" / "stop-ready").exists())
+        run_id = str(started["run_id"])
+        self.assertTrue(self.command("check-run", self.project, "--run-id", run_id)["may_claim"])
+        self.assertTrue(self.claim(run_id, "translator_1")["claimed"])
 
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("ready", result.stderr.lower())
-        with sqlite3.connect(self.project / "state.sqlite") as connection:
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
-
-    def test_guarded_start_rejects_ready_marker_without_prior_stop_canary(self) -> None:
-        self.init_text("A ready marker alone does not prove that Stop ran.")
-        root_id = "root-stop-canary-required"
+    def test_ready_marker_without_stop_marker_does_not_block_start(self) -> None:
+        self.init_text("The optional Stop canary is not a startup requirement.")
+        root_id = "root-stop-canary-optional"
         self.write_ready_marker(root_id, root_id, stop_ready=False)
 
-        result = self.invoke(
+        started = self.command(
             "start",
             self.project,
             cwd=self.temp_root,
             env_overrides=self.root_env(root_id, root_id),
         )
+        self.assertEqual(started["status"], "RUNNING")
 
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("stop-ready", result.stderr.lower())
-        with sqlite3.connect(self.project / "state.sqlite") as connection:
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+    def test_malformed_hook_markers_do_not_authorize_or_block_start(self) -> None:
+        self.init_text("Only project state and cancellation generation govern start.")
+        root_id = "root-malformed-optional-markers"
+        marker = self.write_ready_marker(root_id, root_id)
+        marker.write_text("not JSON", encoding="utf-8")
+        started = self.command(
+            "start",
+            self.project,
+            cwd=self.temp_root,
+            env_overrides=self.root_env(root_id, root_id),
+        )
+        self.assertEqual(started["status"], "RUNNING")
+
 
     def test_guarded_start_records_root_identity_and_active_hook_mapping(self) -> None:
         self.init_text("A guarded run belongs to this root thread.")

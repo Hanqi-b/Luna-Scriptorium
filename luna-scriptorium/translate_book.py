@@ -174,13 +174,11 @@ def _root_guard_require_run_epoch(cwd: Path, thread_id: str, baseline: int) -> N
 
 
 def _root_guard_context() -> tuple[str, str, Path] | None:
-    """Return the guarded root identity, or None for legacy CLI starts.
+    """Return the Codex root identity when available.
 
-    A Codex thread is only allowed to start a guarded run after the project's
-    SessionStart and an earlier Stop hook have published markers for this
-    exact session and working directory.  The environment is intentionally
-    fail-closed: a present but malformed or partial Codex identity, missing
-    marker, or mismatched marker prevents the database start.
+    Lifecycle hooks are optional. Their readiness markers do not authorize a
+    translation run; the root's start request and persisted project state do.
+    Keep checking a real interruption tombstone and cancellation generation.
     """
     thread_id = os.environ.get("CODEX_THREAD_ID")
     session_id = os.environ.get("CODEX_SESSION_ID")
@@ -198,21 +196,6 @@ def _root_guard_context() -> tuple[str, str, Path] | None:
         cwd = Path.cwd().resolve()
     except OSError as exc:
         raise ProjectError("unable to resolve the guarded start working directory") from exc
-    expected = {
-        "session_id": session_id,
-        "cwd": str(cwd),
-        "hook_version": ROOT_GUARD_HOOK_VERSION,
-    }
-    for marker_kind in ("ready", "stop-ready"):
-        marker_path = cwd / ".codex" / "translate-book-guard" / marker_kind / f"{thread_id}.json"
-        try:
-            marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise ProjectError(f"translation root guard {marker_kind} marker is missing: {marker_path}") from exc
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProjectError(f"invalid translation root guard {marker_kind} marker: {marker_path}") from exc
-        if not isinstance(marker, dict) or type(marker.get("hook_version")) is not int or marker != expected:
-            raise ProjectError(f"translation root guard {marker_kind} marker mismatch: {marker_path}")
     _root_guard_require_not_interrupted(cwd, thread_id)
     return thread_id, session_id, cwd
 
@@ -1371,8 +1354,8 @@ def _invalidate_run_in_transaction(connection: sqlite3.Connection, run_id: str) 
 
 
 def _command_start(project: str, root_agent_path: str = "/root") -> dict[str, Any]:
-    # Snapshot the durable root cancellation generation before marker reads or
-    # project I/O.  A Stop hook can append and clear its tombstone while this
+    # Snapshot the durable root cancellation generation before project I/O.
+    # A Stop hook can append and clear its tombstone while this
     # command is opening the project; the generation must still fence it.
     initial_thread_id = os.environ.get("CODEX_THREAD_ID")
     initial_session_id = os.environ.get("CODEX_SESSION_ID")

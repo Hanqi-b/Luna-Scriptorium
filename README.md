@@ -13,7 +13,7 @@ mkdir -p "$HOME/.agents/skills"
 ln -s "$(pwd)/luna-scriptorium" "$HOME/.agents/skills/luna-scriptorium"
 ```
 
-Codex 可自动发现新增 Skill；如果没有显示，重启 Codex。翻译运行还需要在当前受信任项目中启用并验证 `.codex/hooks.json` 的生命周期 hooks。仓库中的 `.artifacts/` 是本地实验记录，不会上传到 GitHub。
+Codex 可自动发现新增 Skill；如果没有显示，重启 Codex。`.codex/hooks.json` 的生命周期 hooks 可提供额外的停止信号，但不是启动翻译的前置条件。仓库中的 `.artifacts/` 是本地实验记录，不会上传到 GitHub。
 
 ## 验证
 
