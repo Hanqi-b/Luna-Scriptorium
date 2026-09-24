@@ -1,39 +1,23 @@
 #!/usr/bin/env python3
-"""Small, recoverable state engine for the four-worker book translation pilot.
+"""Locked work units and atomic translation state for four Codex workers.
 
-This module deliberately does not call a model and does not create child
-processes.  The Codex root agent (and its four fixed translator identities)
-drives it through the JSON CLI:
-
-    python translate_book.py init book.md --project book.translation
-    python translate_book.py start book.translation
-    python translate_book.py claim book.translation --run-id RUN --worker-id translator_1
-    python translate_book.py commit book.translation --run-id RUN \
-        --worker-id translator_1 --attempt-id ATTEMPT --file work/attempts/ATTEMPT.txt
-    python translate_book.py status book.translation
-    python translate_book.py build book.translation
-
-The input adapter is intentionally limited to UTF-8 Markdown/TXT.  Recovery
-of an abandoned run requires an explicit host cleanup acknowledgement.  The
-CLI is a state store and fencing boundary, not a background service or a
-translation API.
+The root agent prepares book input and supervises the four model workers.
+This CLI stores claims, fenced commits, review completion, and Markdown output.
+It does not call a model or convert book formats.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
-import stat
 import sys
 import tempfile
-import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -49,10 +33,7 @@ DEFAULT_MAX_CHARS = 4000
 DEFAULT_CHUNKING_VERSION = 2
 DEFAULT_CONTEXT_CHUNKS = 2
 DEFAULT_CONTEXT_CHARS = 2400
-DEFAULT_ATTEMPT_DEADLINE_SECONDS = 600
 SUPPORTED_SUFFIXES = {".md": "markdown", ".markdown": "markdown", ".txt": "text"}
-ROOT_GUARD_HOOK_VERSION = 1
-ROOT_GUARD_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 class ProjectError(RuntimeError):
@@ -61,10 +42,6 @@ class ProjectError(RuntimeError):
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _epoch_now() -> float:
-    return time.time()
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -98,266 +75,9 @@ def _atomic_write(path: Path, data: bytes) -> None:
             temporary.unlink()
 
 
-def _root_guard_interrupted_path(cwd: Path, thread_id: str) -> Path:
-    return cwd / ".codex" / "translate-book-guard" / "interrupted" / f"{thread_id}.json"
-
-
-def _root_guard_interrupted(cwd: Path, thread_id: str) -> bool:
-    path = _root_guard_interrupted_path(cwd, thread_id)
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        raise ProjectError(f"unable to inspect translation root interruption tombstone: {path}") from exc
-    return True
-
-
-def _root_guard_require_not_interrupted(cwd: Path, thread_id: str) -> None:
-    if _root_guard_interrupted(cwd, thread_id):
-        raise ProjectError(
-            f"translation root interruption tombstone is present; refusing start: "
-            f"{_root_guard_interrupted_path(cwd, thread_id)}"
-        )
-
-
-def _root_guard_interrupt_epoch_path(cwd: Path, thread_id: str) -> Path:
-    return cwd / ".codex" / "translate-book-guard" / "interrupt-epochs" / f"{thread_id}.log"
-
-
-def _root_guard_interrupt_epoch(cwd: Path, thread_id: str) -> tuple[int, int, int, int] | None:
-    path = _root_guard_interrupt_epoch_path(cwd, thread_id)
-    try:
-        metadata = os.stat(path)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise ProjectError(f"unable to inspect translation root interrupt epoch: {path}") from exc
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ProjectError(f"translation root interrupt epoch is not a regular file: {path}")
-    return (
-        int(metadata.st_dev),
-        int(metadata.st_ino),
-        int(metadata.st_size),
-        int(metadata.st_mtime_ns),
-    )
-
-
-def _root_guard_require_interrupt_epoch(
-    cwd: Path,
-    thread_id: str,
-    snapshot: tuple[int, int, int, int] | None,
-) -> None:
-    current = _root_guard_interrupt_epoch(cwd, thread_id)
-    if current != snapshot:
-        raise ProjectError(
-            f"translation root cancellation epoch advanced during start "
-            f"(interrupt epoch advanced during start): "
-            f"{_root_guard_interrupt_epoch_path(cwd, thread_id)}"
-        )
-
-
-def _root_guard_interrupt_epoch_size(cwd: Path, thread_id: str) -> int:
-    """Return the durable append-only cancellation generation for a root."""
-    current = _root_guard_interrupt_epoch(cwd, thread_id)
-    return 0 if current is None else current[2]
-
-
-def _root_guard_require_run_epoch(cwd: Path, thread_id: str, baseline: int) -> None:
-    """Fence a persisted run when its root has interrupted since it started."""
-    if _root_guard_interrupt_epoch_size(cwd, thread_id) != baseline:
-        raise ProjectError(
-            f"translation root cancellation epoch advanced for run "
-            f"(interrupt epoch advanced for run): "
-            f"{_root_guard_interrupt_epoch_path(cwd, thread_id)}"
-        )
-
-
-def _root_guard_context() -> tuple[str, str, Path] | None:
-    """Return the Codex root identity when available.
-
-    Lifecycle hooks are optional. Their readiness markers do not authorize a
-    translation run; the root's start request and persisted project state do.
-    Keep checking a real interruption tombstone and cancellation generation.
-    """
-    thread_id = os.environ.get("CODEX_THREAD_ID")
-    session_id = os.environ.get("CODEX_SESSION_ID")
-    if thread_id is None and session_id is None:
-        return None
-    if thread_id is None:
-        raise ProjectError("CODEX_THREAD_ID is required for a guarded start")
-    if not ROOT_GUARD_ID_PATTERN.fullmatch(thread_id):
-        raise ProjectError("CODEX_THREAD_ID is invalid")
-    if session_id is None or not ROOT_GUARD_ID_PATTERN.fullmatch(session_id):
-        raise ProjectError("CODEX_SESSION_ID is required for a guarded start")
-    if thread_id != session_id:
-        raise ProjectError("CODEX_THREAD_ID and CODEX_SESSION_ID must match for a guarded start")
-    try:
-        cwd = Path.cwd().resolve()
-    except OSError as exc:
-        raise ProjectError("unable to resolve the guarded start working directory") from exc
-    _root_guard_require_not_interrupted(cwd, thread_id)
-    return thread_id, session_id, cwd
-
-
-def _root_guard_active_marker(
-    cwd: Path,
-    thread_id: str,
-    session_id: str,
-    project: Path,
-    run_id: str,
-) -> Path:
-    """Publish the active run mapping before its DB transaction commits."""
-    payload = {
-        "session_id": session_id,
-        "project": str(project),
-        "run_id": run_id,
-    }
-    active_path = _root_guard_active_marker_path(cwd, thread_id, run_id)
-    _atomic_write(active_path, (_dump(payload) + "\n").encode("utf-8"))
-    return active_path
-
-
-def _root_guard_active_marker_path(cwd: Path, thread_id: str, run_id: str) -> Path:
-    return cwd / ".codex" / "translate-book-guard" / "active" / thread_id / f"{run_id}.json"
-
-
-def _root_guard_check_active_mappings(cwd: Path, thread_id: str, run_id: str) -> None:
-    """Reject a second active book mapping for the same root thread."""
-    active_dir = cwd / ".codex" / "translate-book-guard" / "active" / thread_id
-    if active_dir.exists() and not active_dir.is_dir():
-        raise ProjectError(f"translation root active mapping directory is not a directory: {active_dir}")
-    try:
-        mappings = [
-            candidate
-            for candidate in active_dir.iterdir()
-            if candidate.name.endswith(".json") and candidate.name != f"{run_id}.json"
-        ]
-    except FileNotFoundError:
-        mappings = []
-    except OSError as exc:
-        raise ProjectError(f"unable to inspect translation root active mappings: {active_dir}") from exc
-    if mappings:
-        raise ProjectError(
-            f"translation root already owns an active mapping for this thread: {mappings[0]}"
-        )
-
-
-def _root_guard_remove_active_marker(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise ProjectError(f"unable to remove failed translation root active marker: {path}") from exc
-
-
-def _root_guard_start_cancellation(
-    cwd: Path,
-    thread_id: str,
-    interrupt_epoch: tuple[int, int, int, int] | None,
-) -> tuple[bool, BaseException | None]:
-    """Check both the clearable tombstone and durable cancellation epoch."""
-    try:
-        if _root_guard_interrupted(cwd, thread_id):
-            return True, None
-        _root_guard_require_interrupt_epoch(cwd, thread_id, interrupt_epoch)
-    except BaseException as exc:
-        return True, exc
-    return False, None
-
-
-def _root_guard_stop_cancelled_start(
-    connection: sqlite3.Connection,
-    run_id: str,
-    marker_path: Path,
-    cancellation_error: BaseException | None,
-) -> None:
-    """Stop a run fenced after its start transaction and retain its marker on failure."""
-    try:
-        with _transaction(connection):
-            _stop_run_in_transaction(connection, run_id, "root interrupted during start")
-    except BaseException as exc:
-        raise ProjectError(
-            f"translation start was interrupted but its run could not be stopped; "
-            f"active marker preserved for recovery: {exc}"
-        ) from exc
-    _root_guard_remove_active_marker(marker_path)
-    if cancellation_error is not None:
-        raise ProjectError(
-            f"translation start cancellation could not be verified; run was stopped: "
-            f"{cancellation_error}"
-        ) from cancellation_error
-    raise ProjectError("translation start cancelled by the root interruption tombstone")
-
-
-@contextmanager
-def _root_guard_start_lock(cwd: Path, thread_id: str) -> Iterator[None]:
-    """Serialize guarded starts with the Stop hook's scan and fencing."""
-    lock_path = cwd / ".codex" / "translate-book-guard" / "locks" / f"{thread_id}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    except OSError as exc:
-        raise ProjectError(f"unable to acquire translation root guard lock: {lock_path}") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-@contextmanager
-def _start_transaction(
-    connection: sqlite3.Connection,
-    guard_context: tuple[str, str, Path] | None,
-    project: Path,
-    run_id: str,
-    interrupt_epoch: tuple[int, int, int, int] | None,
-) -> Iterator[sqlite3.Connection]:
-    """Publish a guarded mapping and start its DB transaction under one lock."""
-    if guard_context is None:
-        with _transaction(connection) as active_connection:
-            yield active_connection
-        return
-    thread_id, session_id, cwd = guard_context
-    marker_path = _root_guard_active_marker_path(cwd, thread_id, run_id)
-    with _root_guard_start_lock(cwd, thread_id):
-        _root_guard_require_not_interrupted(cwd, thread_id)
-        _root_guard_require_interrupt_epoch(cwd, thread_id, interrupt_epoch)
-        _root_guard_check_active_mappings(cwd, thread_id, run_id)
-        marker_path = _root_guard_active_marker(cwd, thread_id, session_id, project, run_id)
-        try:
-            with _transaction(
-                connection,
-                thread_id,
-                cwd,
-                interrupt_epoch,
-                check_interrupt_epoch=True,
-            ) as active_connection:
-                yield active_connection
-        except BaseException as exc:
-            try:
-                _root_guard_remove_active_marker(marker_path)
-            except BaseException as cleanup_exc:
-                raise ProjectError(
-                    f"translation start failed: {exc}; active marker cleanup failed: {cleanup_exc}"
-                ) from exc
-            raise
-        cancelled, cancellation_error = _root_guard_start_cancellation(cwd, thread_id, interrupt_epoch)
-        if cancelled:
-            _root_guard_stop_cancelled_start(connection, run_id, marker_path, cancellation_error)
-
-    # The hook appends its durable epoch before waiting for this lock.  Check
-    # once more after releasing it so a late interrupt cannot make this call
-    # return a RUNNING result while the hook is timing out on the lock.
-    cancelled, cancellation_error = _root_guard_start_cancellation(cwd, thread_id, interrupt_epoch)
-    if cancelled:
-        _root_guard_stop_cancelled_start(connection, run_id, marker_path, cancellation_error)
+def _root_thread_id() -> str | None:
+    """Keep the host identity for diagnostics; it never gates startup."""
+    return os.environ.get("CODEX_THREAD_ID") or None
 
 
 def _safe_relative(root: Path, relative: str) -> Path:
@@ -380,38 +100,11 @@ def _connect(database: Path) -> sqlite3.Connection:
 
 
 @contextmanager
-def _transaction(
-    connection: sqlite3.Connection,
-    guarded_root_thread_id: str | None = None,
-    guarded_root_cwd: Path | None = None,
-    guarded_interrupt_epoch: tuple[int, int, int, int] | None = None,
-    check_interrupt_epoch: bool = False,
-    guarded_run_epoch: int | None = None,
-) -> Iterator[sqlite3.Connection]:
-    """Start a short serialized write transaction."""
+def _transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Serialize a short, atomic state change."""
     connection.execute("BEGIN IMMEDIATE")
     try:
-        if guarded_root_thread_id is not None:
-            guard_cwd = Path.cwd().resolve() if guarded_root_cwd is None else guarded_root_cwd
-            _root_guard_require_not_interrupted(guard_cwd, guarded_root_thread_id)
-            if check_interrupt_epoch:
-                if guarded_run_epoch is None:
-                    _root_guard_require_interrupt_epoch(
-                        guard_cwd, guarded_root_thread_id, guarded_interrupt_epoch
-                    )
-                else:
-                    _root_guard_require_run_epoch(guard_cwd, guarded_root_thread_id, guarded_run_epoch)
         yield connection
-        if guarded_root_thread_id is not None:
-            guard_cwd = Path.cwd().resolve() if guarded_root_cwd is None else guarded_root_cwd
-            _root_guard_require_not_interrupted(guard_cwd, guarded_root_thread_id)
-            if check_interrupt_epoch:
-                if guarded_run_epoch is None:
-                    _root_guard_require_interrupt_epoch(
-                        guard_cwd, guarded_root_thread_id, guarded_interrupt_epoch
-                    )
-                else:
-                    _root_guard_require_run_epoch(guard_cwd, guarded_root_thread_id, guarded_run_epoch)
     except BaseException:
         connection.rollback()
         raise
@@ -674,20 +367,12 @@ def _init_database(database: Path, config: Mapping[str, Any], source_hash: str, 
                 stop_requested INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 ended_at TEXT,
-                started_at REAL,
-                last_heartbeat REAL,
-                heartbeat_token_hash TEXT,
-                cleanup_verified_at TEXT,
-                root_thread_id TEXT,
-                root_guard_cwd TEXT,
-                root_guard_epoch INTEGER
+                root_thread_id TEXT
             );
             CREATE TABLE worker_registry (
                 worker_id TEXT PRIMARY KEY,
                 canonical_path TEXT NOT NULL,
-                expected_run_id TEXT,
-                observed_state TEXT,
-                observed_at TEXT
+                expected_run_id TEXT
             );
             CREATE TABLE chapters (
                 chapter_id TEXT PRIMARY KEY,
@@ -719,8 +404,7 @@ def _init_database(database: Path, config: Mapping[str, Any], source_hash: str, 
                 state TEXT NOT NULL,
                 error TEXT,
                 started_at TEXT NOT NULL,
-                ended_at TEXT,
-                deadline_at REAL
+                ended_at TEXT
             );
             CREATE INDEX attempts_active ON attempts(run_id, worker_id, state);
             CREATE TABLE translations (
@@ -734,6 +418,20 @@ def _init_database(database: Path, config: Mapping[str, Any], source_hash: str, 
                 build_id TEXT PRIMARY KEY,
                 output_path TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE qa_flags (
+                chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id),
+                code TEXT NOT NULL,
+                details TEXT NOT NULL,
+                PRIMARY KEY(chunk_id, code)
+            );
+            CREATE TABLE reviews (
+                stage TEXT NOT NULL,
+                unit_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                report TEXT,
+                completed_at TEXT,
+                PRIMARY KEY(stage, unit_id)
             );
             """
         )
@@ -764,6 +462,15 @@ def _init_database(database: Path, config: Mapping[str, Any], source_hash: str, 
                     """,
                     (chunk["chunk_id"], chapter_id, chunk["chunk_number"], chunk["source"], chunk["source_hash"]),
                 )
+            chapters = list(dict.fromkeys(str(chunk["chapter_id"]) for chunk in chunks))
+            connection.executemany(
+                "INSERT INTO reviews(stage, unit_id) VALUES ('chapter', ?)",
+                ((chapter_id,) for chapter_id in chapters),
+            )
+            connection.executemany(
+                "INSERT INTO reviews(stage, unit_id) VALUES ('consistency', ?)",
+                ((f"batch{index:03d}",) for index in range(1, (len(chapters) + 3) // 4 + 1)),
+            )
     finally:
         connection.close()
 
@@ -866,7 +573,6 @@ def _command_init(
             "context_chars": DEFAULT_CONTEXT_CHARS,
         },
         "retry": {"max_attempts": MAX_ATTEMPTS},
-        "shutdown": {"attempt_deadline_seconds": DEFAULT_ATTEMPT_DEADLINE_SECONDS},
         "workers": {"max": MAX_WORKERS, "ids": list(WORKER_IDS)},
     }
     _atomic_write(root / "config.json", _config_bytes(config))
@@ -955,169 +661,27 @@ def _worker_paths(root_agent_path: str) -> dict[str, str]:
 
 
 def _ensure_schema_compatibility(connection: sqlite3.Connection) -> None:
-    """Apply additive migrations without changing the config hash.
-
-    The heartbeat columns came from the earlier prototype and are retained so
-    existing databases can still be opened.  They are intentionally inert in
-    the current lifecycle: claim and commit use terminal run fencing and the
-    non-renewing attempt deadline instead.  New lifecycle columns are added
-    rather than rewriting an existing project's config or state rows.
-    """
-    chunk_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(chunks)").fetchall()}
-    run_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
-    attempt_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(attempts)").fetchall()}
-    table_names = {
-        str(row[0])
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-    }
-    registry_columns = (
-        {str(row[1]) for row in connection.execute("PRAGMA table_info(worker_registry)").fetchall()}
-        if "worker_registry" in table_names
-        else set()
-    )
-    meta_keys = {str(row[0]) for row in connection.execute("SELECT key FROM meta").fetchall()}
-    missing = (
-        "failure_count" not in chunk_columns
-        or "started_at" not in run_columns
-        or "last_heartbeat" not in run_columns
-        or "heartbeat_token_hash" not in run_columns
-        or "cleanup_verified_at" not in run_columns
-        or "root_thread_id" not in run_columns
-        or "root_guard_cwd" not in run_columns
-        or "root_guard_epoch" not in run_columns
-        or "deadline_at" not in attempt_columns
-        or "current_run_id" not in meta_keys
-        or not {"worker_id", "canonical_path", "expected_run_id", "observed_state", "observed_at"}.issubset(registry_columns)
-    )
-    if not missing:
-        return
-
-    def legacy_epoch(value: object) -> float:
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp()
-        except (TypeError, ValueError, OverflowError):
-            # An unparseable legacy timestamp cannot prove that the old root
-            # is alive.  Keep the migrated run fenced until an explicit
-            # recovery starts a new supervised run.
-            return 0.0
-
-    def attempt_deadline(value: object) -> float:
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp() + DEFAULT_ATTEMPT_DEADLINE_SECONDS
-        except (TypeError, ValueError, OverflowError):
-            # A malformed historical timestamp cannot prove that the attempt
-            # is still within its window.  Failing it closed is safer than
-            # allowing an unbounded old result to commit.
-            return 0.0
-
+    """Open earlier projects without changing their signed config or source."""
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     with _transaction(connection):
-        # Re-read under the writer lock so concurrent first opens do not race
-        # on ALTER TABLE after another process has completed the migration.
-        chunk_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(chunks)").fetchall()}
-        run_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
-        if "failure_count" not in chunk_columns:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(chunks)")}
+        if "failure_count" not in columns:
             connection.execute("ALTER TABLE chunks ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0")
-            failed_rows = connection.execute(
-                "SELECT chunk_id, COUNT(*) AS count FROM attempts WHERE state = 'FAILED' GROUP BY chunk_id"
-            ).fetchall()
-            for row in failed_rows:
-                connection.execute(
-                    "UPDATE chunks SET failure_count = ? WHERE chunk_id = ?",
-                    (int(row["count"]), row["chunk_id"]),
-                )
-        if "started_at" not in run_columns:
-            connection.execute("ALTER TABLE runs ADD COLUMN started_at REAL")
-        if "last_heartbeat" not in run_columns:
-            connection.execute("ALTER TABLE runs ADD COLUMN last_heartbeat REAL")
-        if "heartbeat_token_hash" not in run_columns:
-            connection.execute("ALTER TABLE runs ADD COLUMN heartbeat_token_hash TEXT")
-        if "cleanup_verified_at" not in run_columns:
-            connection.execute("ALTER TABLE runs ADD COLUMN cleanup_verified_at TEXT")
-        if "root_thread_id" not in run_columns:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+        if "root_thread_id" not in columns:
             connection.execute("ALTER TABLE runs ADD COLUMN root_thread_id TEXT")
-        if "root_guard_cwd" not in run_columns:
-            connection.execute("ALTER TABLE runs ADD COLUMN root_guard_cwd TEXT")
-        if "root_guard_epoch" not in run_columns:
-            connection.execute("ALTER TABLE runs ADD COLUMN root_guard_epoch INTEGER")
-        if "deadline_at" not in attempt_columns:
-            connection.execute("ALTER TABLE attempts ADD COLUMN deadline_at REAL")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS worker_registry (
-                worker_id TEXT PRIMARY KEY,
-                canonical_path TEXT NOT NULL,
-                expected_run_id TEXT,
-                observed_state TEXT,
-                observed_at TEXT
-            )
-            """
-        )
-        registry_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(worker_registry)").fetchall()}
-        if "canonical_path" not in registry_columns:
-            connection.execute("ALTER TABLE worker_registry ADD COLUMN canonical_path TEXT")
-        if "expected_run_id" not in registry_columns:
-            connection.execute("ALTER TABLE worker_registry ADD COLUMN expected_run_id TEXT")
-        if "observed_state" not in registry_columns:
-            connection.execute("ALTER TABLE worker_registry ADD COLUMN observed_state TEXT")
-        if "observed_at" not in registry_columns:
-            connection.execute("ALTER TABLE worker_registry ADD COLUMN observed_at TEXT")
-        rows = connection.execute(
-            "SELECT run_id, status, created_at, started_at, last_heartbeat, heartbeat_token_hash, cleanup_verified_at FROM runs"
-        ).fetchall()
-        for row in rows:
-            started_at = row["started_at"]
-            last_heartbeat = row["last_heartbeat"]
-            fallback = legacy_epoch(row["created_at"])
-            if started_at is None:
-                started_at = fallback
-            if row["heartbeat_token_hash"] is None or last_heartbeat is None:
-                last_heartbeat = 0.0
-            connection.execute(
-                """
-                UPDATE runs
-                SET started_at = ?, last_heartbeat = ?
-                WHERE run_id = ?
-                """,
-                (float(started_at), float(last_heartbeat), row["run_id"]),
-            )
-        attempts = connection.execute(
-            "SELECT attempt_id, started_at, deadline_at FROM attempts WHERE deadline_at IS NULL"
-        ).fetchall()
-        for attempt in attempts:
-            connection.execute(
-                "UPDATE attempts SET deadline_at = ? WHERE attempt_id = ?",
-                (attempt_deadline(attempt["started_at"]), attempt["attempt_id"]),
-            )
-        if "current_run_id" not in meta_keys:
-            active = connection.execute(
-                "SELECT run_id FROM runs WHERE status IN ('RUNNING', 'STOPPING') ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-            connection.execute(
-                "INSERT INTO meta(key, value) VALUES ('current_run_id', ?)",
-                ("" if active is None else str(active["run_id"]),),
-            )
-        current = connection.execute("SELECT value FROM meta WHERE key = 'current_run_id'").fetchone()
-        current_id = str(current[0]) if current is not None and str(current[0]) else None
-        if current_id is None:
-            latest = connection.execute(
-                "SELECT run_id FROM runs ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-            current_id = None if latest is None else str(latest["run_id"])
+        connection.execute("CREATE TABLE IF NOT EXISTS worker_registry (worker_id TEXT PRIMARY KEY, canonical_path TEXT NOT NULL, expected_run_id TEXT)")
+        connection.execute("CREATE TABLE IF NOT EXISTS qa_flags (chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id), code TEXT NOT NULL, details TEXT NOT NULL, PRIMARY KEY(chunk_id, code))")
+        connection.execute("CREATE TABLE IF NOT EXISTS reviews (stage TEXT NOT NULL, unit_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING', report TEXT, completed_at TEXT, PRIMARY KEY(stage, unit_id))")
+        if "current_run_id" not in {row[0] for row in connection.execute("SELECT key FROM meta")}:
+            active = connection.execute("SELECT run_id FROM runs WHERE status IN ('RUNNING','STOPPING') ORDER BY rowid DESC LIMIT 1").fetchone()
+            connection.execute("INSERT INTO meta(key,value) VALUES ('current_run_id',?)", ("" if active is None else active[0],))
         for worker_id, canonical_path in WORKER_CANONICAL_PATHS.items():
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO worker_registry(
-                    worker_id, canonical_path, expected_run_id, observed_state, observed_at
-                ) VALUES (?, ?, ?, NULL, NULL)
-                """,
-                (worker_id, canonical_path, current_id),
-            )
+            connection.execute("INSERT OR IGNORE INTO worker_registry(worker_id,canonical_path) VALUES (?,?)", (worker_id, canonical_path))
+        if "reviews" not in tables:
+            chapters = [row[0] for row in connection.execute("SELECT chapter_id FROM chapters ORDER BY chapter_number")]
+            connection.executemany("INSERT INTO reviews(stage,unit_id) VALUES ('chapter',?)", ((chapter,) for chapter in chapters))
+            connection.executemany("INSERT INTO reviews(stage,unit_id) VALUES ('consistency',?)", ((f"batch{n:03d}",) for n in range(1, (len(chapters)+3)//4+1)))
 
 
 def _ensure_worker(worker_id: str) -> None:
@@ -1126,7 +690,7 @@ def _ensure_worker(worker_id: str) -> None:
 
 
 def _run_row(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
-    row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    row = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
     if row is None:
         raise ProjectError(f"unknown run_id: {run_id}")
     return row
@@ -1135,1450 +699,427 @@ def _run_row(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
 def _verify_stored_plan(connection: sqlite3.Connection, config: Mapping[str, Any]) -> None:
     expected = config.get("plan_sha256")
     if expected is None:
-        return  # A project initialized before plan locking keeps its stored chunks.
-    meta = connection.execute("SELECT value FROM meta WHERE key = 'plan_sha256'").fetchone()
-    if meta is None or str(meta[0]) != expected:
+        return
+    meta = connection.execute("SELECT value FROM meta WHERE key='plan_sha256'").fetchone()
+    if meta is None or meta[0] != expected:
         raise ProjectError("stored chunk plan metadata differs from the locked plan")
-    rows = connection.execute(
-        """
-        SELECT h.chapter_id, h.chapter_number, h.title,
-               c.chunk_id, c.chunk_number, c.source, c.source_hash
-        FROM chunks c JOIN chapters h ON h.chapter_id = c.chapter_id
-        ORDER BY h.chapter_number, c.chunk_number
-        """
-    ).fetchall()
+    rows = connection.execute("SELECT h.chapter_id,h.chapter_number,h.title,c.chunk_id,c.chunk_number,c.source,c.source_hash FROM chunks c JOIN chapters h ON h.chapter_id=c.chapter_id ORDER BY h.chapter_number,c.chunk_number").fetchall()
     if not rows:
         raise ProjectError("stored chunk plan is empty")
-    chunks: list[dict[str, Any]] = []
     for row in rows:
-        if _sha256_bytes(str(row["source"]).encode("utf-8")) != row["source_hash"]:
+        if _sha256_bytes(row["source"].encode("utf-8")) != row["source_hash"]:
             raise ProjectError(f"stored chunk source changed: {row['chunk_id']}")
-        chunks.append(dict(row))
-    if _plan_hash(chunks) != expected:
+    if _plan_hash([dict(row) for row in rows]) != expected:
         raise ProjectError("stored chunk plan differs from the locked plan")
 
 
-def _run_guard_context(
-    connection: sqlite3.Connection,
-    run_id: str,
-) -> tuple[str | None, Path | None, int | None]:
-    """Load the immutable root fencing context persisted with a run."""
-    row = connection.execute(
-        "SELECT root_thread_id, root_guard_cwd, root_guard_epoch FROM runs WHERE run_id = ?",
-        (run_id,),
-    ).fetchone()
-    if row is None or row["root_thread_id"] is None:
-        return None, None, None
-    root_thread_id = str(row["root_thread_id"])
-    raw_cwd = row["root_guard_cwd"]
-    raw_epoch = row["root_guard_epoch"]
-    if raw_cwd is None or not str(raw_cwd):
-        raise ProjectError(f"guarded run {run_id} is missing its root guard cwd")
-    guarded_cwd = Path(str(raw_cwd))
-    if not guarded_cwd.is_absolute():
-        raise ProjectError(f"guarded run {run_id} has a non-absolute root guard cwd")
-    if raw_epoch is None:
-        raise ProjectError(f"guarded run {run_id} is missing its root guard epoch")
-    try:
-        guarded_epoch = int(raw_epoch)
-    except (TypeError, ValueError) as exc:
-        raise ProjectError(f"guarded run {run_id} has an invalid root guard epoch") from exc
-    if guarded_epoch < 0:
-        raise ProjectError(f"guarded run {run_id} has an invalid root guard epoch")
-    return root_thread_id, guarded_cwd, guarded_epoch
-
-
-def _attempt_deadline_seconds(config: Mapping[str, Any]) -> int:
-    return _config_int(
-        config,
-        "shutdown",
-        "attempt_deadline_seconds",
-        DEFAULT_ATTEMPT_DEADLINE_SECONDS,
-    )
-
-
 def _current_run_id(connection: sqlite3.Connection) -> str | None:
-    row = connection.execute("SELECT value FROM meta WHERE key = 'current_run_id'").fetchone()
-    if row is None or not str(row[0]):
-        return None
-    return str(row[0])
+    row = connection.execute("SELECT value FROM meta WHERE key='current_run_id'").fetchone()
+    return str(row[0]) if row is not None and row[0] else None
 
 
 def _set_current_run_id(connection: sqlite3.Connection, run_id: str | None) -> None:
-    value = "" if run_id is None else run_id
-    connection.execute(
-        "INSERT INTO meta(key, value) VALUES ('current_run_id', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (value,),
-    )
-
-
-def _run_is_current(connection: sqlite3.Connection, run_id: str) -> bool:
-    return _current_run_id(connection) == run_id
-
-
-def _deadline_fresh(attempt: sqlite3.Row, now: float | None = None) -> bool:
-    raw_deadline = attempt["deadline_at"]
-    try:
-        deadline = float(raw_deadline) if raw_deadline is not None else 0.0
-    except (TypeError, ValueError):
-        deadline = 0.0
-    return (_epoch_now() if now is None else now) <= deadline
+    connection.execute("INSERT INTO meta(key,value) VALUES ('current_run_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (run_id or "",))
 
 
 def _latest_run(connection: sqlite3.Connection) -> sqlite3.Row | None:
-    # created_at is intentionally human-readable and second-resolution.  A
-    # rapid stop/restart can therefore create multiple runs with the same
-    # timestamp; rowid preserves their serialized insertion order.
     return connection.execute("SELECT * FROM runs ORDER BY rowid DESC LIMIT 1").fetchone()
 
 
 def _refresh_chapters(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        """
-        UPDATE chapters
-        SET state = 'FAILED', owner_run_id = NULL, owner_worker_id = NULL
-        WHERE EXISTS (
-            SELECT 1 FROM chunks WHERE chunks.chapter_id = chapters.chapter_id AND chunks.state = 'FAILED'
-        )
-        """
-    )
-    connection.execute(
-        """
-        UPDATE chapters
-        SET state = 'DONE', owner_run_id = NULL, owner_worker_id = NULL
-        WHERE NOT EXISTS (
-            SELECT 1 FROM chunks WHERE chunks.chapter_id = chapters.chapter_id AND chunks.state != 'DONE'
-        )
-        """
-    )
-    connection.execute(
-        """
-        UPDATE chapters
-        SET state = CASE WHEN state = 'DONE' THEN 'DONE' ELSE 'PENDING' END
-        WHERE state NOT IN ('DONE', 'FAILED')
-          AND NOT EXISTS (
-              SELECT 1 FROM chunks WHERE chunks.chapter_id = chapters.chapter_id AND chunks.state = 'RUNNING'
-          )
-          AND owner_worker_id IS NULL
-        """
-    )
+    connection.execute("UPDATE chapters SET state='FAILED',owner_run_id=NULL,owner_worker_id=NULL WHERE EXISTS (SELECT 1 FROM chunks c WHERE c.chapter_id=chapters.chapter_id AND c.state='FAILED')")
+    connection.execute("UPDATE chapters SET state='DONE',owner_run_id=NULL,owner_worker_id=NULL WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.chapter_id=chapters.chapter_id AND c.state!='DONE')")
+    connection.execute("UPDATE chapters SET state='PENDING' WHERE state NOT IN ('DONE','FAILED') AND owner_worker_id IS NULL")
 
 
 def _refresh_run_after_activity(connection: sqlite3.Connection, run_id: str) -> str:
-    row = _run_row(connection, run_id)
-    incomplete = connection.execute("SELECT COUNT(*) FROM chunks WHERE state != 'DONE'").fetchone()[0]
+    incomplete = connection.execute("SELECT COUNT(*) FROM chunks WHERE state!='DONE'").fetchone()[0]
     if incomplete == 0:
-        now = _utc_now()
-        connection.execute(
-            """
-            UPDATE runs
-            SET status = 'COMPLETED', stop_requested = 1, ended_at = ?
-            WHERE run_id = ?
-            """,
-            (now, run_id),
-        )
-        if _run_is_current(connection, run_id):
+        connection.execute("UPDATE runs SET status='COMPLETED',stop_requested=1,ended_at=? WHERE run_id=?", (_utc_now(), run_id))
+        if _current_run_id(connection) == run_id:
             _set_current_run_id(connection, None)
         return "COMPLETED"
-    return str(row["status"])
+    return str(_run_row(connection, run_id)["status"])
 
 
-def _interrupt_run_attempts(
-    connection: sqlite3.Connection,
-    run_id: str,
-    error: str,
-) -> int:
-    """Fence a run's active attempts and retain their chunks as INTERRUPTED."""
-    running_attempts = connection.execute(
-        "SELECT attempt_id, chunk_id FROM attempts WHERE state = 'RUNNING'"
-        " AND run_id = ?",
-        (run_id,),
-    ).fetchall()
-    recovered = len(running_attempts)
-    now = _utc_now()
-    for attempt in running_attempts:
-        connection.execute(
-            "UPDATE attempts SET state = 'INTERRUPTED', ended_at = ?, error = ? WHERE attempt_id = ?",
-            (now, error, attempt["attempt_id"]),
-        )
-        connection.execute(
-            """
-            UPDATE chunks SET state = 'INTERRUPTED', current_attempt_id = NULL, current_worker_id = NULL
-            WHERE chunk_id = ? AND state = 'RUNNING' AND current_attempt_id = ?
-            """,
-            (attempt["chunk_id"], attempt["attempt_id"]),
-        )
-    connection.execute(
-        """
-        UPDATE chunks SET state = 'INTERRUPTED', current_attempt_id = NULL, current_worker_id = NULL
-        WHERE state = 'RUNNING'
-          AND (
-              EXISTS (SELECT 1 FROM attempts a WHERE a.chunk_id = chunks.chunk_id AND a.run_id = ?)
-              OR EXISTS (SELECT 1 FROM chapters h WHERE h.chapter_id = chunks.chapter_id AND h.owner_run_id = ?)
-          )
-        """
-        , (run_id, run_id)
-    )
-    connection.execute(
-        "UPDATE chapters SET owner_run_id = NULL, owner_worker_id = NULL WHERE owner_run_id = ?",
-        (run_id,),
-    )
+def _interrupt_run_attempts(connection: sqlite3.Connection, run_id: str, error: str) -> int:
+    attempts = connection.execute("SELECT attempt_id,chunk_id FROM attempts WHERE run_id=? AND state='RUNNING'", (run_id,)).fetchall()
+    for attempt in attempts:
+        connection.execute("UPDATE attempts SET state='INTERRUPTED',ended_at=?,error=? WHERE attempt_id=?", (_utc_now(), error, attempt["attempt_id"]))
+        connection.execute("UPDATE chunks SET state='PENDING',current_attempt_id=NULL,current_worker_id=NULL WHERE chunk_id=? AND current_attempt_id=?", (attempt["chunk_id"], attempt["attempt_id"]))
+    connection.execute("UPDATE chapters SET owner_run_id=NULL,owner_worker_id=NULL WHERE owner_run_id=?", (run_id,))
     _refresh_chapters(connection)
-    return recovered
-
-
-def _invalidate_run_in_transaction(connection: sqlite3.Connection, run_id: str) -> int:
-    """Fence one run after the caller has established that its root is gone."""
-    run = _run_row(connection, run_id)
-    if run["status"] not in ("RUNNING", "STOPPING"):
-        return 0
-    now = _utc_now()
-    connection.execute(
-        """
-        UPDATE runs
-        SET status = 'INTERRUPTED', stop_requested = 1, ended_at = ?, cleanup_verified_at = NULL
-        WHERE run_id = ? AND status IN ('RUNNING', 'STOPPING')
-        """,
-        (now, run_id),
-    )
-    interrupted = _interrupt_run_attempts(connection, run_id, "run invalidated after root loss")
-    connection.execute(
-        "UPDATE chapters SET owner_run_id = NULL, owner_worker_id = NULL WHERE owner_run_id = ?",
-        (run_id,),
-    )
-    _refresh_chapters(connection)
-    if _run_is_current(connection, run_id):
-        _set_current_run_id(connection, None)
-    return interrupted
+    return len(attempts)
 
 
 def _command_start(project: str, root_agent_path: str = "/root") -> dict[str, Any]:
-    # Snapshot the durable root cancellation generation before project I/O.
-    # A Stop hook can append and clear its tombstone while this
-    # command is opening the project; the generation must still fence it.
-    initial_thread_id = os.environ.get("CODEX_THREAD_ID")
-    initial_session_id = os.environ.get("CODEX_SESSION_ID")
-    initial_guard_cwd: Path | None = None
-    interrupt_epoch: tuple[int, int, int, int] | None = None
-    if (
-        initial_thread_id is not None
-        and initial_session_id is not None
-        and initial_thread_id == initial_session_id
-        and ROOT_GUARD_ID_PATTERN.fullmatch(initial_thread_id)
-    ):
-        try:
-            initial_guard_cwd = Path.cwd().resolve()
-        except OSError as exc:
-            raise ProjectError("unable to resolve the guarded start working directory") from exc
-        interrupt_epoch = _root_guard_interrupt_epoch(initial_guard_cwd, initial_thread_id)
-    guard_context = _root_guard_context()
-    root_thread_id = None if guard_context is None else guard_context[0]
-    root_guard_cwd: str | None = None
-    root_guard_epoch: int | None = None
-    if guard_context is not None:
-        _guard_thread_id, _session_id, guarded_cwd = guard_context
-        if initial_guard_cwd != guarded_cwd or initial_thread_id != _guard_thread_id:
-            raise ProjectError("guarded start identity changed while establishing its cancellation epoch")
-        root_guard_cwd = str(guarded_cwd)
-        root_guard_epoch = 0 if interrupt_epoch is None else interrupt_epoch[2]
     root, connection, config = _open_project(project)
     worker_paths = _worker_paths(root_agent_path)
-    run_id = uuid.uuid4().hex
     try:
-        with _start_transaction(connection, guard_context, root, run_id, interrupt_epoch):
+        with _transaction(connection):
             _verify_stored_plan(connection, config)
-            active = connection.execute(
-                """
-                SELECT run_id FROM runs
-                WHERE status IN ('RUNNING', 'STOPPING')
-                ORDER BY rowid DESC LIMIT 1
-                """
-            ).fetchone()
+            active = connection.execute("SELECT run_id FROM runs WHERE status IN ('RUNNING','STOPPING') ORDER BY rowid DESC LIMIT 1").fetchone()
             if active is not None:
-                raise ProjectError(
-                    f"run {active['run_id']} is still active; stop it or explicitly invalidate-run after root loss"
-                )
-            active_attempt = connection.execute(
-                "SELECT run_id FROM attempts WHERE state = 'RUNNING' ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
+                raise ProjectError(f"run {active[0]} is still active; inspect host workers and stop it before starting another run")
+            active_attempt = connection.execute("SELECT attempt_id FROM attempts WHERE state='RUNNING' LIMIT 1").fetchone()
             if active_attempt is not None:
-                raise ProjectError(
-                    f"run {active_attempt['run_id']} still has a RUNNING attempt; "
-                    "clean up that run before start"
-                )
-            unverified = connection.execute(
-                """
-                SELECT run_id FROM runs
-                WHERE status IN ('STOPPED', 'INTERRUPTED', 'COMPLETED') AND cleanup_verified_at IS NULL
-                ORDER BY rowid DESC LIMIT 1
-                """
-            ).fetchone()
-            if unverified is not None:
-                raise ProjectError(
-                    f"workers for run {unverified['run_id']} must be confirmed cleared; "
-                    f"run confirm-cleanup before start"
-                )
-            interrupted = connection.execute(
-                "SELECT COUNT(*) FROM chunks WHERE state = 'INTERRUPTED'"
-            ).fetchone()[0]
-            connection.execute(
-                """
-                UPDATE chunks
-                SET state = 'PENDING', current_attempt_id = NULL, current_worker_id = NULL
-                WHERE state = 'INTERRUPTED'
-                """
-            )
-            connection.execute(
-                """
-                UPDATE chapters SET owner_run_id = NULL, owner_worker_id = NULL
-                WHERE state NOT IN ('DONE', 'FAILED')
-                """
-            )
+                raise ProjectError("active attempt remains; stop the owning run first")
+            done = connection.execute("SELECT COUNT(*) FROM chunks WHERE state='DONE'").fetchone()[0]
+            total = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            if done == total:
+                return {"command":"start","project":str(root),"status":"COMPLETED","already_completed":True,"run_id":None,"workers":list(WORKER_IDS),"worker_paths":worker_paths}
+            connection.execute("UPDATE chunks SET state='PENDING',failure_count=0,current_attempt_id=NULL,current_worker_id=NULL WHERE state!='DONE'")
+            connection.execute("UPDATE chapters SET state='PENDING',owner_run_id=NULL,owner_worker_id=NULL WHERE state!='DONE'")
             _refresh_chapters(connection)
-            incomplete = connection.execute("SELECT COUNT(*) FROM chunks WHERE state != 'DONE'").fetchone()[0]
-            status = "RUNNING" if incomplete else "COMPLETED"
-            created_at = _utc_now()
-            started_at = _epoch_now()
-            # DB completion does not prove that the host has released all
-            # worker identities.  The root must call confirm-cleanup after it
-            # observes the host state.
-            cleanup_verified_at = None
-            connection.execute(
-                """
-                INSERT INTO runs(
-                    run_id, status, stop_requested, created_at, ended_at,
-                    started_at, last_heartbeat, heartbeat_token_hash,
-                    cleanup_verified_at, root_thread_id, root_guard_cwd, root_guard_epoch
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    status,
-                    int(status == "COMPLETED"),
-                    created_at,
-                    created_at if status == "COMPLETED" else None,
-                    started_at,
-                    cleanup_verified_at,
-                    root_thread_id,
-                    root_guard_cwd,
-                    root_guard_epoch,
-                ),
-            )
-            for worker_id, canonical_path in worker_paths.items():
-                connection.execute(
-                    """
-                    INSERT INTO worker_registry(
-                        worker_id, canonical_path, expected_run_id, observed_state, observed_at
-                    ) VALUES (?, ?, ?, NULL, NULL)
-                    ON CONFLICT(worker_id) DO UPDATE SET
-                        canonical_path = excluded.canonical_path,
-                        expected_run_id = excluded.expected_run_id,
-                        observed_state = NULL,
-                        observed_at = NULL
-                    """,
-                    (worker_id, canonical_path, run_id),
-                )
-            _set_current_run_id(connection, run_id if status == "RUNNING" else None)
-        if guard_context is not None:
-            cancelled, cancellation_error = _root_guard_start_cancellation(
-                guard_context[2], guard_context[0], interrupt_epoch
-            )
-            if cancelled:
-                _root_guard_stop_cancelled_start(
-                    connection,
-                    run_id,
-                    _root_guard_active_marker_path(guard_context[2], guard_context[0], run_id),
-                    cancellation_error,
-                )
-        result = {
-            "command": "start",
-            "project": str(root),
-            "run_id": str(run_id),
-            "root_thread_id": root_thread_id,
-            "root_guard_cwd": root_guard_cwd,
-            "root_guard_epoch": root_guard_epoch,
-            "status": status,
-            "resumed_chunks": int(interrupted),
-            "workers": list(WORKER_IDS),
-            "worker_paths": worker_paths,
-            "source_language": config.get("source_language", "auto"),
-            "target_language": config.get("target_language", "zh-CN"),
-            "config_schema_version": config.get("schema_version"),
-        }
+            run_id = uuid.uuid4().hex
+            connection.execute("INSERT INTO runs(run_id,status,stop_requested,created_at,root_thread_id) VALUES (?,'RUNNING',0,?,?)", (run_id,_utc_now(),_root_thread_id()))
+            for worker_id, path in worker_paths.items():
+                connection.execute("INSERT INTO worker_registry(worker_id,canonical_path,expected_run_id) VALUES (?,?,?) ON CONFLICT(worker_id) DO UPDATE SET canonical_path=excluded.canonical_path,expected_run_id=excluded.expected_run_id", (worker_id,path,run_id))
+            _set_current_run_id(connection, run_id)
+        return {"command":"start","project":str(root),"run_id":run_id,"status":"RUNNING","resumed_chunks":total-done,"workers":list(WORKER_IDS),"worker_paths":worker_paths,"source_language":config.get("source_language","auto"),"target_language":config.get("target_language","zh-CN")}
     finally:
         connection.close()
-    return result
 
 
 def _current_worker_attempt(connection: sqlite3.Connection, run_id: str, worker_id: str) -> sqlite3.Row | None:
-    return connection.execute(
-        "SELECT * FROM attempts WHERE run_id = ? AND worker_id = ? AND state = 'RUNNING' LIMIT 1",
-        (run_id, worker_id),
-    ).fetchone()
+    return connection.execute("SELECT * FROM attempts WHERE run_id=? AND worker_id=? AND state='RUNNING' LIMIT 1", (run_id,worker_id)).fetchone()
 
 
 def _command_claim(project: str, run_id: str, worker_id: str) -> dict[str, Any]:
     _ensure_worker(worker_id)
     root, connection, config = _open_project(project)
     try:
-        guarded_root_thread_id, guarded_root_cwd, guarded_run_epoch = _run_guard_context(connection, run_id)
-        with _transaction(
-            connection,
-            guarded_root_thread_id,
-            guarded_root_cwd,
-            check_interrupt_epoch=True,
-            guarded_run_epoch=guarded_run_epoch,
-        ):
+        with _transaction(connection):
             run = _run_row(connection, run_id)
-            if not _run_is_current(connection, run_id):
-                return {"command": "claim", "claimed": False, "reason": "STALE_RUN", "run_id": run_id}
-            if run["status"] != "RUNNING" or run["stop_requested"]:
-                return {"command": "claim", "claimed": False, "reason": "STOP_REQUESTED", "run_id": run_id}
-            current_attempt = _current_worker_attempt(connection, run_id, worker_id)
-            if current_attempt is not None and not _deadline_fresh(current_attempt):
-                return {
-                    "command": "claim",
-                    "claimed": False,
-                    "reason": "ATTEMPT_DEADLINE_EXPIRED",
-                    "run_id": run_id,
-                    "attempt_id": current_attempt["attempt_id"],
-                }
-            if current_attempt is not None:
-                raise ProjectError(f"{worker_id} already has a RUNNING attempt; commit, fail, or interrupt it first")
-            active_count = connection.execute(
-                "SELECT COUNT(*) FROM attempts WHERE run_id = ? AND state = 'RUNNING'", (run_id,)
-            ).fetchone()[0]
-            if active_count >= MAX_WORKERS:
-                raise ProjectError("the run already has the maximum four active workers")
-            max_attempts = _config_int(config, "retry", "max_attempts", MAX_ATTEMPTS)
-            connection.execute(
-                "UPDATE chunks SET state = 'FAILED' WHERE state = 'PENDING' AND failure_count >= ?", (max_attempts,)
-            )
-            _refresh_chapters(connection)
-            owned = connection.execute(
-                """
-                SELECT * FROM chapters
-                WHERE owner_run_id = ? AND owner_worker_id = ? AND state NOT IN ('DONE', 'FAILED')
-                  AND EXISTS (
-                      SELECT 1 FROM chunks
-                      WHERE chunks.chapter_id = chapters.chapter_id AND chunks.state = 'PENDING'
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM chunks
-                      WHERE chunks.chapter_id = chapters.chapter_id AND chunks.state = 'INTERRUPTED'
-                  )
-                ORDER BY chapter_number LIMIT 1
-                """,
-                (run_id, worker_id),
-            ).fetchone()
-            chapter = owned
+            if _current_run_id(connection) != run_id or run["status"] != "RUNNING" or run["stop_requested"]:
+                return {"command":"claim","claimed":False,"reason":"STALE_RUN","run_id":run_id}
+            if _current_worker_attempt(connection, run_id, worker_id) is not None:
+                raise ProjectError(f"{worker_id} already has a RUNNING attempt")
+            if connection.execute("SELECT COUNT(*) FROM attempts WHERE run_id=? AND state='RUNNING'",(run_id,)).fetchone()[0] >= MAX_WORKERS:
+                raise ProjectError("maximum four active workers")
+            chapter = connection.execute("SELECT * FROM chapters WHERE owner_run_id=? AND owner_worker_id=? AND state!='FAILED' AND EXISTS (SELECT 1 FROM chunks c WHERE c.chapter_id=chapters.chapter_id AND c.state='PENDING') ORDER BY chapter_number LIMIT 1",(run_id,worker_id)).fetchone()
             if chapter is None:
-                chapter = connection.execute(
-                    """
-                    SELECT * FROM chapters
-                    WHERE owner_run_id IS NULL AND owner_worker_id IS NULL AND state NOT IN ('DONE', 'FAILED')
-                      AND EXISTS (
-                          SELECT 1 FROM chunks
-                          WHERE chunks.chapter_id = chapters.chapter_id AND chunks.state = 'PENDING'
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM chunks
-                          WHERE chunks.chapter_id = chapters.chapter_id AND chunks.state = 'INTERRUPTED'
-                      )
-                    ORDER BY chapter_number LIMIT 1
-                    """
-                ).fetchone()
+                chapter = connection.execute("SELECT * FROM chapters WHERE owner_run_id IS NULL AND owner_worker_id IS NULL AND state NOT IN ('DONE','FAILED') AND EXISTS (SELECT 1 FROM chunks c WHERE c.chapter_id=chapters.chapter_id AND c.state='PENDING') ORDER BY chapter_number LIMIT 1").fetchone()
                 if chapter is not None:
-                    connection.execute(
-                        """
-                        UPDATE chapters SET owner_run_id = ?, owner_worker_id = ?, state = 'RUNNING'
-                        WHERE chapter_id = ? AND owner_run_id IS NULL AND owner_worker_id IS NULL
-                        """,
-                        (run_id, worker_id, chapter["chapter_id"]),
-                    )
+                    connection.execute("UPDATE chapters SET owner_run_id=?,owner_worker_id=?,state='RUNNING' WHERE chapter_id=?",(run_id,worker_id,chapter["chapter_id"]))
             if chapter is None:
-                return {"command": "claim", "claimed": False, "reason": "NO_WORK", "run_id": run_id}
-            chunk = connection.execute(
-                """
-                SELECT * FROM chunks
-                WHERE chapter_id = ? AND state = 'PENDING'
-                ORDER BY chunk_number LIMIT 1
-                """,
-                (chapter["chapter_id"],),
-            ).fetchone()
+                return {"command":"claim","claimed":False,"reason":"NO_WORK","run_id":run_id}
+            chunk = connection.execute("SELECT * FROM chunks WHERE chapter_id=? AND state='PENDING' ORDER BY chunk_number LIMIT 1",(chapter["chapter_id"],)).fetchone()
             if chunk is None:
-                _refresh_chapters(connection)
-                return {"command": "claim", "claimed": False, "reason": "NO_WORK", "run_id": run_id}
-            attempt_number = int(chunk["attempts_used"]) + 1
+                return {"command":"claim","claimed":False,"reason":"NO_WORK","run_id":run_id}
             attempt_id = uuid.uuid4().hex
-            now = _utc_now()
-            deadline_at = _epoch_now() + _attempt_deadline_seconds(config)
-            connection.execute(
-                """
-                INSERT INTO attempts(
-                    attempt_id, run_id, worker_id, chunk_id, attempt_number, state, started_at, deadline_at
-                ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?)
-                """,
-                (attempt_id, run_id, worker_id, chunk["chunk_id"], attempt_number, now, deadline_at),
-            )
-            connection.execute(
-                """
-                UPDATE chunks
-                SET state = 'RUNNING', attempts_used = ?, current_attempt_id = ?, current_worker_id = ?
-                WHERE chunk_id = ? AND state = 'PENDING'
-                """,
-                (attempt_number, attempt_id, worker_id, chunk["chunk_id"]),
-            )
-            context_limit = _config_int(config, "chunking", "context_chunks", DEFAULT_CONTEXT_CHUNKS)
-            context_chars = _config_int(config, "chunking", "context_chars", DEFAULT_CONTEXT_CHARS)
-            previous = connection.execute(
-                """
-                SELECT c.chunk_id, t.text
-                FROM chunks c JOIN translations t ON t.chunk_id = c.chunk_id
-                WHERE c.chapter_id = ? AND c.chunk_number < ? AND c.state = 'DONE'
-                ORDER BY c.chunk_number DESC LIMIT ?
-                """,
-                (chunk["chapter_id"], chunk["chunk_number"], context_limit),
-            ).fetchall()
-            context: list[dict[str, str]] = []
-            used_chars = 0
-            for previous_row in reversed(previous):
-                text = str(previous_row["text"])
-                remaining = context_chars - used_chars
-                if remaining <= 0:
+            attempt_number = int(chunk["attempts_used"])+1
+            connection.execute("INSERT INTO attempts(attempt_id,run_id,worker_id,chunk_id,attempt_number,state,started_at) VALUES (?,?,?,?,?,'RUNNING',?)",(attempt_id,run_id,worker_id,chunk["chunk_id"],attempt_number,_utc_now()))
+            connection.execute("UPDATE chunks SET state='RUNNING',attempts_used=?,current_attempt_id=?,current_worker_id=? WHERE chunk_id=?",(attempt_number,attempt_id,worker_id,chunk["chunk_id"]))
+            context_limit = _config_int(config,"chunking","context_chunks",DEFAULT_CONTEXT_CHUNKS)
+            context_chars = _config_int(config,"chunking","context_chars",DEFAULT_CONTEXT_CHARS)
+            prior = connection.execute("SELECT c.chunk_id,t.text FROM chunks c JOIN translations t ON t.chunk_id=c.chunk_id WHERE c.chapter_id=? AND c.chunk_number<? AND c.state='DONE' ORDER BY c.chunk_number DESC LIMIT ?",(chunk["chapter_id"],chunk["chunk_number"],context_limit)).fetchall()
+            context = []
+            used = 0
+            for row in reversed(prior):
+                if used >= context_chars:
                     break
-                text = text[:remaining]
-                context.append({"chunk_id": str(previous_row["chunk_id"]), "text": text})
-                used_chars += len(text)
-            return {
-                "command": "claim",
-                "claimed": True,
-                "run_id": run_id,
-                "worker_id": worker_id,
-                "attempt_id": attempt_id,
-                "attempt_number": attempt_number,
-                "deadline_at": deadline_at,
-                "attempt_deadline_seconds": _attempt_deadline_seconds(config),
-                "chapter_id": chunk["chapter_id"],
-                "chunk_id": chunk["chunk_id"],
-                "chunk_number": chunk["chunk_number"],
-                "chapter_title": chapter["title"],
-                "source": chunk["source"],
-                "source_language": config.get("source_language", "auto"),
-                "target_language": config.get("target_language", "zh-CN"),
-                "context": context,
-                "previous_context": context,
-                "context_text": "\n\n".join(item["text"] for item in context),
-            }
+                snippet = str(row["text"])[:context_chars-used]
+                context.append({"chunk_id":row["chunk_id"],"text":snippet})
+                used += len(snippet)
+            return {"command":"claim","claimed":True,"run_id":run_id,"worker_id":worker_id,"attempt_id":attempt_id,"attempt_number":attempt_number,"chapter_id":chunk["chapter_id"],"chunk_id":chunk["chunk_id"],"chunk_number":chunk["chunk_number"],"chapter_title":chapter["title"],"source":chunk["source"],"source_language":config.get("source_language","auto"),"target_language":config.get("target_language","zh-CN"),"context":context}
     finally:
         connection.close()
 
 
-def _attempt_for_write(
-    connection: sqlite3.Connection,
-    run_id: str,
-    worker_id: str,
-    attempt_id: str,
-    config: Mapping[str, Any],
-) -> tuple[sqlite3.Row, sqlite3.Row]:
+def _attempt_for_write(connection: sqlite3.Connection, run_id: str, worker_id: str, attempt_id: str) -> sqlite3.Row:
     run = _run_row(connection, run_id)
-    if not _run_is_current(connection, run_id):
-        raise ProjectError(f"run {run_id} is not accepting worker results (not the project's current run)")
-    if run["status"] != "RUNNING":
-        raise ProjectError(f"run {run_id} is not accepting worker results ({run['status']})")
-    attempt = connection.execute(
-        "SELECT * FROM attempts WHERE attempt_id = ? AND run_id = ? AND worker_id = ? AND state = 'RUNNING'",
-        (attempt_id, run_id, worker_id),
-    ).fetchone()
+    if _current_run_id(connection) != run_id or run["status"] != "RUNNING" or run["stop_requested"]:
+        raise ProjectError("run is no longer accepting worker results")
+    attempt = connection.execute("SELECT * FROM attempts WHERE attempt_id=? AND run_id=? AND worker_id=? AND state='RUNNING'",(attempt_id,run_id,worker_id)).fetchone()
     if attempt is None:
         raise ProjectError("stale, interrupted, or mismatched attempt_id")
-    if not _deadline_fresh(attempt):
-        raise ProjectError("attempt deadline expired; result is stale")
-    chunk = connection.execute(
-        "SELECT * FROM chunks WHERE chunk_id = ? AND state = 'RUNNING' AND current_attempt_id = ? AND current_worker_id = ?",
-        (attempt["chunk_id"], attempt_id, worker_id),
-    ).fetchone()
+    chunk = connection.execute("SELECT * FROM chunks WHERE chunk_id=? AND state='RUNNING' AND current_attempt_id=? AND current_worker_id=?",(attempt["chunk_id"],attempt_id,worker_id)).fetchone()
     if chunk is None:
         raise ProjectError("attempt no longer owns its chunk")
-    return run, chunk
+    return chunk
 
 
 def _read_translation_file(path: str, project_root: Path | None = None) -> str:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute() and project_root is not None:
-        candidate = _safe_relative(project_root, str(candidate))
+        candidate = _safe_relative(project_root,str(candidate))
     try:
-        data = candidate.read_bytes()
-        text = data.decode("utf-8")
+        text = candidate.read_bytes().decode("utf-8")
     except FileNotFoundError as exc:
-        raise ProjectError(f"translation file not found: {path}") from exc
+        raise ProjectError(f"file not found: {path}") from exc
     except UnicodeDecodeError as exc:
-        raise ProjectError("translation candidate must be UTF-8") from exc
-    if not text.strip():
-        raise ProjectError("translation candidate is empty")
-    if "\x00" in text:
-        raise ProjectError("translation candidate contains a NUL byte")
+        raise ProjectError("candidate must be UTF-8") from exc
+    if not text.strip() or "\x00" in text:
+        raise ProjectError("candidate is empty or contains a NUL byte")
     return _normalise_text(text).rstrip()
 
 
 def _numeric_tokens(text: str) -> list[str]:
-    """Return canonical multi-digit tokens whose loss is usually an error."""
-    # Unicode `\w` includes Han characters, so `1492年` must still count.
-    matches = re.findall(r"(?<![0-9])[0-9][0-9,./:%-]*[0-9](?![0-9])", text)
-    return [re.sub(r"\D", "", match) for match in matches]
+    return [re.sub(r"\D","",match) for match in re.findall(r"(?<![0-9])[0-9][0-9,./:%-]*[0-9](?![0-9])",text)]
 
 
-def _mechanical_check(source: str, translation: str) -> None:
-    source_tokens = Counter(_numeric_tokens(source))
-    translation_tokens = Counter(_numeric_tokens(translation))
-    missing = [token for token, count in source_tokens.items() if translation_tokens[token] < count]
-    if missing:
-        raise ProjectError(
-            "mechanical QA failed: translation is missing source digit token(s): "
-            + ", ".join(sorted(missing))
-        )
-    source_heading = re.match(r"^\s*(#{1,6})(?=\s)", source)
+def _mechanical_check(source: str, translation: str) -> list[str]:
+    source_heading = re.match(r"^\s*(#{1,6})(?=\s)",source)
     if source_heading:
-        translation_heading = re.match(r"^\s*(#{1,6})(?=\s)", translation)
-        if not translation_heading or translation_heading.group(1) != source_heading.group(1):
-            raise ProjectError(
-                "mechanical QA failed: Markdown heading marker must be preserved on the first line"
-            )
+        target_heading = re.match(r"^\s*(#{1,6})(?=\s)",translation)
+        if not target_heading or target_heading.group(1) != source_heading.group(1):
+            raise ProjectError("mechanical QA failed: Markdown heading marker must be preserved on the first line")
+    original, translated = Counter(_numeric_tokens(source)), Counter(_numeric_tokens(translation))
+    return sorted(token for token,count in original.items() if translated[token] < count)
 
 
 def _command_commit(project: str, run_id: str, worker_id: str, attempt_id: str, file_path: str) -> dict[str, Any]:
     _ensure_worker(worker_id)
-    root, connection, _config = _open_project(project)
+    root, connection, _ = _open_project(project)
     try:
-        guarded_root_thread_id, guarded_root_cwd, guarded_run_epoch = _run_guard_context(connection, run_id)
-        if guarded_root_thread_id is not None:
-            if guarded_root_cwd is None or guarded_run_epoch is None:
-                raise ProjectError(f"guarded run {run_id} is missing its root fencing context")
-            _root_guard_require_not_interrupted(guarded_root_cwd, guarded_root_thread_id)
-            _root_guard_require_run_epoch(guarded_root_cwd, guarded_root_thread_id, guarded_run_epoch)
-        # Relative candidate paths are resolved against the project first,
-        # while absolute paths remain useful for a root-managed temp file.
-        translation = _read_translation_file(file_path, root)
-        with _transaction(
-            connection,
-            guarded_root_thread_id,
-            guarded_root_cwd,
-            check_interrupt_epoch=True,
-            guarded_run_epoch=guarded_run_epoch,
-        ):
-            run, chunk = _attempt_for_write(connection, run_id, worker_id, attempt_id, _config)
-            _mechanical_check(str(chunk["source"]), translation)
+        translation = _read_translation_file(file_path,root)
+        with _transaction(connection):
+            chunk = _attempt_for_write(connection,run_id,worker_id,attempt_id)
+            missing = _mechanical_check(str(chunk["source"]),translation)
             now = _utc_now()
-            connection.execute(
-                "UPDATE attempts SET state = 'DONE', ended_at = ?, error = NULL WHERE attempt_id = ?",
-                (now, attempt_id),
-            )
-            connection.execute(
-                """
-                INSERT INTO translations(chunk_id, attempt_id, text, text_hash, committed_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(chunk_id) DO UPDATE SET
-                    attempt_id = excluded.attempt_id,
-                    text = excluded.text,
-                    text_hash = excluded.text_hash,
-                    committed_at = excluded.committed_at
-                """,
-                (chunk["chunk_id"], attempt_id, translation, _sha256_bytes(translation.encode("utf-8")), now),
-            )
-            connection.execute(
-                """
-                UPDATE chunks SET state = 'DONE', current_attempt_id = NULL, current_worker_id = NULL
-                WHERE chunk_id = ? AND state = 'RUNNING' AND current_attempt_id = ?
-                """,
-                (chunk["chunk_id"], attempt_id),
-            )
+            connection.execute("UPDATE attempts SET state='DONE',ended_at=?,error=NULL WHERE attempt_id=?",(now,attempt_id))
+            connection.execute("INSERT INTO translations(chunk_id,attempt_id,text,text_hash,committed_at) VALUES (?,?,?,?,?) ON CONFLICT(chunk_id) DO UPDATE SET attempt_id=excluded.attempt_id,text=excluded.text,text_hash=excluded.text_hash,committed_at=excluded.committed_at",(chunk["chunk_id"],attempt_id,translation,_sha256_bytes(translation.encode("utf-8")),now))
+            connection.execute("UPDATE chunks SET state='DONE',current_attempt_id=NULL,current_worker_id=NULL WHERE chunk_id=? AND current_attempt_id=?",(chunk["chunk_id"],attempt_id))
+            if missing:
+                connection.execute("INSERT INTO qa_flags(chunk_id,code,details) VALUES (?,'SUSPECT_MISSING_NUMBERS',?) ON CONFLICT(chunk_id,code) DO UPDATE SET details=excluded.details",(chunk["chunk_id"],','.join(missing)))
             _refresh_chapters(connection)
-            status = _refresh_run_after_activity(connection, run_id)
-            chapter = connection.execute(
-                "SELECT state FROM chapters WHERE chapter_id = ?", (chunk["chapter_id"],)
-            ).fetchone()[0]
-        return {
-            "command": "commit",
-            "committed": True,
-            "project": str(root),
-            "run_id": run_id,
-            "worker_id": worker_id,
-            "attempt_id": attempt_id,
-            "chunk_id": chunk["chunk_id"],
-            "chapter_state": chapter,
-            "run_status": status,
-        }
+            status = _refresh_run_after_activity(connection,run_id)
+        return {"command":"commit","committed":True,"project":str(root),"run_id":run_id,"worker_id":worker_id,"attempt_id":attempt_id,"chunk_id":chunk["chunk_id"],"suspect_missing_numbers":missing,"run_status":status}
     finally:
         connection.close()
 
 
-def _command_fail(
-    project: str, run_id: str, worker_id: str, attempt_id: str, error: str
-) -> dict[str, Any]:
+def _command_fail(project: str, run_id: str, worker_id: str, attempt_id: str, error: str) -> dict[str, Any]:
     _ensure_worker(worker_id)
     if not error.strip():
         raise ProjectError("--error must not be empty")
     root, connection, config = _open_project(project)
     try:
-        guarded_root_thread_id, guarded_root_cwd, guarded_run_epoch = _run_guard_context(connection, run_id)
-        if guarded_root_thread_id is not None:
-            if guarded_root_cwd is None or guarded_run_epoch is None:
-                raise ProjectError(f"guarded run {run_id} is missing its root fencing context")
-            _root_guard_require_not_interrupted(guarded_root_cwd, guarded_root_thread_id)
-            _root_guard_require_run_epoch(guarded_root_cwd, guarded_root_thread_id, guarded_run_epoch)
-        with _transaction(
-            connection,
-            guarded_root_thread_id,
-            guarded_root_cwd,
-            check_interrupt_epoch=True,
-            guarded_run_epoch=guarded_run_epoch,
-        ):
-            _run, chunk = _attempt_for_write(connection, run_id, worker_id, attempt_id, config)
-            max_attempts = _config_int(config, "retry", "max_attempts", MAX_ATTEMPTS)
-            failure_count = int(chunk["failure_count"]) + 1
-            exhausted = failure_count >= max_attempts
-            now = _utc_now()
-            connection.execute(
-                "UPDATE attempts SET state = 'FAILED', ended_at = ?, error = ? WHERE attempt_id = ?",
-                (now, error, attempt_id),
-            )
-            connection.execute(
-                """
-                UPDATE chunks
-                SET state = ?, failure_count = ?, current_attempt_id = NULL, current_worker_id = NULL
-                WHERE chunk_id = ? AND current_attempt_id = ?
-                """,
-                ("FAILED" if exhausted else "PENDING", failure_count, chunk["chunk_id"], attempt_id),
-            )
+        with _transaction(connection):
+            chunk = _attempt_for_write(connection,run_id,worker_id,attempt_id)
+            failures = int(chunk["failure_count"])+1
+            retryable = failures < _config_int(config,"retry","max_attempts",MAX_ATTEMPTS)
+            connection.execute("UPDATE attempts SET state='FAILED',ended_at=?,error=? WHERE attempt_id=?",(_utc_now(),error,attempt_id))
+            connection.execute("UPDATE chunks SET state=?,failure_count=?,current_attempt_id=NULL,current_worker_id=NULL WHERE chunk_id=? AND current_attempt_id=?",("PENDING" if retryable else "FAILED",failures,chunk["chunk_id"],attempt_id))
             _refresh_chapters(connection)
-            status = _refresh_run_after_activity(connection, run_id)
-        return {
-            "command": "fail",
-            "failed": True,
-            "project": str(root),
-            "run_id": run_id,
-            "worker_id": worker_id,
-            "attempt_id": attempt_id,
-            "chunk_id": chunk["chunk_id"],
-            "retryable": not exhausted,
-            "run_status": status,
-        }
+            status = _refresh_run_after_activity(connection,run_id)
+        return {"command":"fail","failed":True,"project":str(root),"chunk_id":chunk["chunk_id"],"retryable":retryable,"run_status":status}
     finally:
         connection.close()
 
 
 def _stop_run_in_transaction(connection: sqlite3.Connection, run_id: str, error: str) -> dict[str, Any]:
-    run = _run_row(connection, run_id)
-    if run["status"] in ("COMPLETED", "STOPPED", "INTERRUPTED"):
-        return {
-            "status": str(run["status"]),
-            "interrupted": 0,
-            "cleanup_verified": run["cleanup_verified_at"] is not None,
-        }
-    now = _utc_now()
-    # The terminal run write is in the same SQLite transaction as attempt
-    # invalidation.  It happens first so no observer can see a live run after
-    # its cleanup transaction commits.
-    connection.execute(
-        """
-        UPDATE runs
-        SET status = 'STOPPED', stop_requested = 1, ended_at = ?, cleanup_verified_at = NULL
-        WHERE run_id = ? AND status IN ('RUNNING', 'STOPPING')
-        """,
-        (now, run_id),
-    )
-    interrupted = _interrupt_run_attempts(connection, run_id, error)
-    connection.execute(
-        "UPDATE chapters SET owner_run_id = NULL, owner_worker_id = NULL WHERE owner_run_id = ?",
-        (run_id,),
-    )
-    _refresh_chapters(connection)
-    if _run_is_current(connection, run_id):
-        _set_current_run_id(connection, None)
-    return {"status": "STOPPED", "interrupted": interrupted, "cleanup_verified": False}
+    run = _run_row(connection,run_id)
+    if run["status"] not in ("RUNNING","STOPPING"):
+        return {"status":str(run["status"]),"interrupted":0}
+    connection.execute("UPDATE runs SET status='STOPPED',stop_requested=1,ended_at=? WHERE run_id=?",(_utc_now(),run_id))
+    interrupted = _interrupt_run_attempts(connection,run_id,error)
+    if _current_run_id(connection) == run_id:
+        _set_current_run_id(connection,None)
+    return {"status":"STOPPED","interrupted":interrupted}
 
 
 def _command_stop(project: str, run_id: str, command: str = "stop") -> dict[str, Any]:
-    root, connection, _config = _open_project(project)
+    root, connection, _ = _open_project(project)
     try:
         with _transaction(connection):
-            result = _stop_run_in_transaction(connection, run_id, f"{command} requested")
-        return {"command": command, "project": str(root), "run_id": run_id, **result}
-    finally:
-        connection.close()
-
-
-def _command_stop_for_root(project: str, run_id: str, root_thread_id: str) -> dict[str, Any]:
-    """Fence a run only when the active DB owner matches the root mapping."""
-    root, connection, _config = _open_project(project)
-    try:
-        with _transaction(connection):
-            current_run_id = _current_run_id(connection)
-            run = connection.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if (
-                run is None
-                or current_run_id != run_id
-                or run["root_thread_id"] != root_thread_id
-            ):
-                return {
-                    "command": "stop-for-root",
-                    "project": str(root),
-                    "run_id": run_id,
-                    "root_thread_id": root_thread_id,
-                    "stopped": False,
-                    "reason": "ROOT_OR_RUN_MISMATCH",
-                    "status": None if run is None else str(run["status"]),
-                    "current_run_id": current_run_id,
-                    "interrupted": 0,
-                }
-            result = _stop_run_in_transaction(connection, run_id, "root stop requested")
-            stopped = str(run["status"]) in ("RUNNING", "STOPPING") and result["status"] == "STOPPED"
-            return {
-                "command": "stop-for-root",
-                "project": str(root),
-                "run_id": run_id,
-                "root_thread_id": root_thread_id,
-                "stopped": stopped,
-                "reason": None if stopped else "ALREADY_TERMINAL",
-                "current_run_id": _current_run_id(connection),
-                **result,
-            }
-    finally:
-        connection.close()
-
-
-def _parse_worker_observations(
-    released_workers: Sequence[str] | None,
-    not_spawned_workers: Sequence[str] | None,
-    worker_states: Sequence[str] | None,
-) -> dict[str, str]:
-    observations: dict[str, str] = {}
-
-    def add(worker_id: str, state: str) -> None:
-        _ensure_worker(worker_id)
-        if worker_id in observations:
-            raise ProjectError(f"duplicate cleanup observation for {worker_id}")
-        observations[worker_id] = state
-
-    for worker_id in released_workers or ():
-        add(str(worker_id), "INACTIVE")
-    for worker_id in not_spawned_workers or ():
-        add(str(worker_id), "NOT_SPAWNED")
-    allowed = {
-        "inactive": "INACTIVE",
-        "released": "INACTIVE",
-        "active": "ACTIVE",
-        "unknown": "UNKNOWN",
-        "not_spawned": "NOT_SPAWNED",
-        "not-spawned": "NOT_SPAWNED",
-    }
-    for item in worker_states or ():
-        if "=" not in item:
-            raise ProjectError("--worker-state must use WORKER_ID=inactive|active|unknown")
-        worker_id, raw_state = item.split("=", 1)
-        state = allowed.get(raw_state.strip().lower())
-        if state is None:
-            raise ProjectError(
-                f"unknown worker state {raw_state!r}; use inactive, active, unknown, or not-spawned"
-            )
-        add(worker_id.strip(), state)
-    return observations
-
-
-def _command_confirm_cleanup(
-    project: str,
-    run_id: str,
-    released_workers: Sequence[str] | None = None,
-    not_spawned_workers: Sequence[str] | None = None,
-    worker_states: Sequence[str] | None = None,
-) -> dict[str, Any]:
-    observations = _parse_worker_observations(released_workers, not_spawned_workers, worker_states)
-    root, connection, _config = _open_project(project)
-    try:
-        failure: str | None = None
-        verified_at: str | None = None
-        observed_payload: dict[str, str] = {}
-        with _transaction(connection):
-            run = _run_row(connection, run_id)
-            if run["status"] not in ("STOPPED", "INTERRUPTED", "COMPLETED"):
-                raise ProjectError(
-                    f"run {run_id} is not terminal; stop or invalidate it before confirming cleanup"
-                )
-            registry = connection.execute(
-                "SELECT worker_id, canonical_path, expected_run_id, observed_state, observed_at "
-                "FROM worker_registry ORDER BY worker_id"
-            ).fetchall()
-            if len(registry) != MAX_WORKERS or {str(row["worker_id"]) for row in registry} != set(WORKER_IDS):
-                raise ProjectError("worker registry is incomplete; cannot confirm cleanup")
-            mismatched = [
-                str(row["worker_id"])
-                for row in registry
-                if row["expected_run_id"] not in (None, run_id)
-            ]
-            if mismatched:
-                raise ProjectError(
-                    "worker registry is bound to another run: " + ", ".join(sorted(mismatched))
-                )
-            observed_at = _utc_now()
-            for worker_id, state in observations.items():
-                connection.execute(
-                    """
-                    UPDATE worker_registry
-                    SET expected_run_id = ?, observed_state = ?, observed_at = ?
-                    WHERE worker_id = ?
-                    """,
-                    (run_id, state, observed_at, worker_id),
-                )
-            active = connection.execute(
-                "SELECT COUNT(*) FROM attempts WHERE run_id = ? AND state = 'RUNNING'",
-                (run_id,),
-            ).fetchone()[0]
-            registry = connection.execute(
-                "SELECT worker_id, observed_state FROM worker_registry ORDER BY worker_id"
-            ).fetchall()
-            observed_payload = {str(row["worker_id"]): str(row["observed_state"] or "") for row in registry}
-            missing = [worker_id for worker_id in WORKER_IDS if not observed_payload.get(worker_id)]
-            unsafe = [
-                worker_id
-                for worker_id, state in observed_payload.items()
-                if state not in ("INACTIVE", "NOT_SPAWNED")
-            ]
-            if active:
-                failure = "cannot confirm cleanup while database attempts are RUNNING"
-            elif missing:
-                failure = "cleanup requires an explicit observation for every worker: " + ", ".join(missing)
-            elif unsafe:
-                failure = "cleanup requires all workers to be observed inactive or not-spawned: " + ", ".join(unsafe)
-            else:
-                verified_at = str(run["cleanup_verified_at"] or _utc_now())
-                connection.execute(
-                    "UPDATE runs SET cleanup_verified_at = ? WHERE run_id = ?",
-                    (verified_at, run_id),
-                )
-        if failure is not None:
-            raise ProjectError(failure)
-        return {
-            "command": "confirm-cleanup",
-            "project": str(root),
-            "run_id": run_id,
-            "status": str(run["status"]),
-            "cleanup_verified": True,
-            "cleanup_verified_at": verified_at,
-            "worker_observations": observed_payload,
-        }
-    finally:
-        connection.close()
-
-
-def _command_force_stop(project: str, run_id: str) -> dict[str, Any]:
-    return _command_stop(project, run_id, command="force-stop")
-
-
-def _command_invalidate_run(project: str, run_id: str) -> dict[str, Any]:
-    root, connection, _config = _open_project(project)
-    try:
-        with _transaction(connection):
-            run = _run_row(connection, run_id)
-            if run["status"] not in ("RUNNING", "STOPPING"):
-                return {
-                    "command": "invalidate-run",
-                    "project": str(root),
-                    "run_id": run_id,
-                    "status": str(run["status"]),
-                    "interrupted": 0,
-                    "cleanup_verified": run["cleanup_verified_at"] is not None,
-                }
-            interrupted = _invalidate_run_in_transaction(connection, run_id)
-        return {
-            "command": "invalidate-run",
-            "project": str(root),
-            "run_id": run_id,
-            "status": "INTERRUPTED",
-            "interrupted": interrupted,
-            "cleanup_verified": False,
-        }
+            result = _stop_run_in_transaction(connection,run_id,f"{command} requested")
+        return {"command":command,"project":str(root),"run_id":run_id,**result}
     finally:
         connection.close()
 
 
 def _command_interrupt_worker(project: str, run_id: str, worker_id: str) -> dict[str, Any]:
     _ensure_worker(worker_id)
-    root, connection, _config = _open_project(project)
+    root, connection, _ = _open_project(project)
     try:
         with _transaction(connection):
-            run = _run_row(connection, run_id)
-            if not _run_is_current(connection, run_id) or run["status"] != "RUNNING":
-                return {
-                    "command": "interrupt-worker",
-                    "interrupted": False,
-                    "run_id": run_id,
-                    "worker_id": worker_id,
-                    "reason": "STALE_RUN",
-                }
-            attempt = _current_worker_attempt(connection, run_id, worker_id)
+            run = _run_row(connection,run_id)
+            if _current_run_id(connection) != run_id or run["status"] != "RUNNING":
+                return {"command":"interrupt-worker","interrupted":False,"reason":"STALE_RUN"}
+            attempt = _current_worker_attempt(connection,run_id,worker_id)
             if attempt is None:
-                return {"command": "interrupt-worker", "interrupted": False, "run_id": run_id, "worker_id": worker_id}
-            chunk = connection.execute(
-                "SELECT chapter_id FROM chunks WHERE chunk_id = ?", (attempt["chunk_id"],)
-            ).fetchone()
-            if chunk is None:
-                raise ProjectError("attempt references a missing chunk")
-            now = _utc_now()
-            connection.execute(
-                "UPDATE attempts SET state = 'INTERRUPTED', ended_at = ?, error = ? WHERE attempt_id = ?",
-                (now, "worker interrupted", attempt["attempt_id"]),
-            )
-            connection.execute(
-                """
-                UPDATE chunks SET state = 'INTERRUPTED', current_attempt_id = NULL, current_worker_id = NULL
-                WHERE chunk_id = ? AND current_attempt_id = ?
-                """,
-                (attempt["chunk_id"], attempt["attempt_id"]),
-            )
-            # Keep chapter affinity for this run.  The interrupted chunk
-            # blocks every further claim in the chapter until a supervised
-            # new run normalizes INTERRUPTED chunks back to PENDING.
+                return {"command":"interrupt-worker","interrupted":False}
+            connection.execute("UPDATE attempts SET state='INTERRUPTED',ended_at=?,error='worker interrupted' WHERE attempt_id=?",(_utc_now(),attempt["attempt_id"]))
+            connection.execute("UPDATE chunks SET state='PENDING',current_attempt_id=NULL,current_worker_id=NULL WHERE chunk_id=? AND current_attempt_id=?",(attempt["chunk_id"],attempt["attempt_id"]))
             _refresh_chapters(connection)
-            status = _refresh_run_after_activity(connection, run_id)
-        return {
-            "command": "interrupt-worker",
-            "interrupted": True,
-            "project": str(root),
-            "run_id": run_id,
-            "worker_id": worker_id,
-            "attempt_id": attempt["attempt_id"],
-            "status": status,
-        }
+        return {"command":"interrupt-worker","interrupted":True,"project":str(root),"run_id":run_id,"worker_id":worker_id,"attempt_id":attempt["attempt_id"]}
     finally:
         connection.close()
 
 
-def _run_payload(
-    run: sqlite3.Row | None,
-    config: Mapping[str, Any],
-    current_run_id: str | None = None,
-) -> dict[str, Any] | None:
-    if run is None:
-        return None
-    return {
-        "run_id": run["run_id"],
-        "status": run["status"],
-        "stop_requested": bool(run["stop_requested"]),
-        "created_at": run["created_at"],
-        "ended_at": run["ended_at"],
-        "started_at": run["started_at"],
-        "root_thread_id": run["root_thread_id"],
-        "root_guard_cwd": run["root_guard_cwd"],
-        "root_guard_epoch": run["root_guard_epoch"],
-        "cleanup_verified": run["cleanup_verified_at"] is not None,
-        "cleanup_verified_at": run["cleanup_verified_at"],
-        "current": current_run_id == run["run_id"],
-        "attempt_deadline_seconds": _attempt_deadline_seconds(config),
-    }
-
-
-def _status_payload(root: Path, connection: sqlite3.Connection, config: Mapping[str, Any]) -> dict[str, Any]:
+def _status_payload(root: Path, connection: sqlite3.Connection) -> dict[str, Any]:
     run = _latest_run(connection)
-    current_run_id = _current_run_id(connection)
-    worker_rows = connection.execute(
-        """
-        SELECT worker_id, canonical_path, expected_run_id, observed_state, observed_at
-        FROM worker_registry ORDER BY worker_id
-        """
-    ).fetchall()
-    state_rows = connection.execute("SELECT state, COUNT(*) AS count FROM chunks GROUP BY state").fetchall()
-    chapter_rows = connection.execute(
-        "SELECT chapter_id, chapter_number, title, state, owner_worker_id FROM chapters ORDER BY chapter_number"
-    ).fetchall()
-    active_rows = connection.execute(
-        "SELECT run_id, worker_id, attempt_id, chunk_id, started_at, deadline_at "
-        "FROM attempts WHERE state = 'RUNNING' ORDER BY worker_id"
-    ).fetchall()
-    return {
-        "command": "status",
-        "project": str(root),
-        "run": _run_payload(run, config, current_run_id),
-        "root_thread_id": None if run is None else run["root_thread_id"],
-        "root_guard_cwd": None if run is None else run["root_guard_cwd"],
-        "root_guard_epoch": None if run is None else run["root_guard_epoch"],
-        "current_run_id": current_run_id,
-        "workers": [
-            {
-                "worker_id": row["worker_id"],
-                "canonical_path": row["canonical_path"],
-                "expected_run_id": row["expected_run_id"],
-                "observed_state": row["observed_state"],
-                "observed_at": row["observed_at"],
-            }
-            for row in worker_rows
-        ],
-        "chunks": {
-            "total": sum(int(row["count"]) for row in state_rows),
-            "states": {str(row["state"]): int(row["count"]) for row in state_rows},
-        },
-        "chapters": [
-            {
-                "chapter_id": row["chapter_id"],
-                "chapter_number": row["chapter_number"],
-                "title": row["title"],
-                "state": row["state"],
-                "owner_worker_id": row["owner_worker_id"],
-            }
-            for row in chapter_rows
-        ],
-        "running_attempts": [
-            {
-                "run_id": row["run_id"],
-                "worker_id": row["worker_id"],
-                "attempt_id": row["attempt_id"],
-                "chunk_id": row["chunk_id"],
-                "started_at": row["started_at"],
-                "deadline_at": row["deadline_at"],
-            }
-            for row in active_rows
-        ],
-        "running_attempt_count": len(active_rows),
-    }
+    current = _current_run_id(connection)
+    workers = [dict(row) for row in connection.execute("SELECT worker_id,canonical_path,expected_run_id FROM worker_registry ORDER BY worker_id")]
+    states = {row["state"]:row["n"] for row in connection.execute("SELECT state,COUNT(*) AS n FROM chunks GROUP BY state")}
+    chapters = [dict(row) for row in connection.execute("SELECT chapter_id,chapter_number,title,state,owner_worker_id FROM chapters ORDER BY chapter_number")]
+    attempts = [dict(row) for row in connection.execute("SELECT run_id,worker_id,attempt_id,chunk_id,started_at FROM attempts WHERE state='RUNNING' ORDER BY worker_id")]
+    reviews = {}
+    for stage in ("chapter","consistency"):
+        units = [dict(row) for row in connection.execute("SELECT unit_id,status FROM reviews WHERE stage=? ORDER BY unit_id",(stage,))]
+        reviews[stage] = {"done":sum(unit["status"]=="DONE" for unit in units),"total":len(units),"units":units}
+    flags = [dict(row) for row in connection.execute("SELECT chunk_id,code,details FROM qa_flags ORDER BY chunk_id,code")]
+    return {"command":"status","project":str(root),"run":None if run is None else {"run_id":run["run_id"],"status":run["status"],"stop_requested":bool(run["stop_requested"]),"created_at":run["created_at"],"ended_at":run["ended_at"],"current":current==run["run_id"]},"current_run_id":current,"workers":workers,"chunks":{"total":sum(states.values()),"states":states},"chapters":chapters,"running_attempts":attempts,"running_attempt_count":len(attempts),"reviews":reviews,"qa_flags":flags}
 
 
 def _command_status(project: str) -> dict[str, Any]:
-    root, connection, config = _open_project(project)
+    root, connection, _ = _open_project(project)
     try:
-        return _status_payload(root, connection, config)
+        return _status_payload(root,connection)
     finally:
         connection.close()
 
 
 def _command_check_run(project: str, run_id: str) -> dict[str, Any]:
+    root, connection, _ = _open_project(project)
+    try:
+        run = _run_row(connection,run_id)
+        current = _current_run_id(connection)==run_id
+        allowed = current and run["status"]=="RUNNING" and not run["stop_requested"]
+        return {"command":"check-run","project":str(root),"run_id":run_id,"status":run["status"],"current":current,"stop_requested":bool(run["stop_requested"]),"may_claim":allowed,"may_commit":allowed}
+    finally:
+        connection.close()
+
+
+def _command_review_done(project: str, stage: str, unit_id: str, file_path: str) -> dict[str, Any]:
+    if stage not in ("chapter","consistency"):
+        raise ProjectError("review stage must be chapter or consistency")
     root, connection, config = _open_project(project)
     try:
-        run = _run_row(connection, run_id)
-        current_run_id = _current_run_id(connection)
-        payload = _run_payload(run, config, current_run_id)
-        assert payload is not None
-        current = current_run_id == run_id
-        guard_clear = True
-        guarded_root_thread_id, guarded_root_cwd, guarded_run_epoch = _run_guard_context(connection, run_id)
-        if guarded_root_thread_id is not None:
-            if guarded_root_cwd is None or guarded_run_epoch is None:
-                raise ProjectError(f"guarded run {run_id} is missing its root fencing context")
-            try:
-                _root_guard_require_not_interrupted(guarded_root_cwd, guarded_root_thread_id)
-                _root_guard_require_run_epoch(guarded_root_cwd, guarded_root_thread_id, guarded_run_epoch)
-            except ProjectError:
-                guard_clear = False
-        may_claim = bool(
-            guard_clear and current and run["status"] == "RUNNING" and not run["stop_requested"]
-        )
-        may_commit = bool(guard_clear and current and run["status"] == "RUNNING")
-        return {
-            "command": "check-run",
-            "project": str(root),
-            "run": payload,
-            # Keep lifecycle decision fields at the top level so a worker can
-            # consume this command without depending on the larger status
-            # envelope.
-            "run_id": payload["run_id"],
-            "root_thread_id": payload["root_thread_id"],
-            "root_guard_cwd": payload["root_guard_cwd"],
-            "root_guard_epoch": payload["root_guard_epoch"],
-            "status": payload["status"],
-            "stop_requested": payload["stop_requested"],
-            "current": current,
-            "cleanup_verified": payload["cleanup_verified"],
-            "cleanup_verified_at": payload["cleanup_verified_at"],
-            "may_claim": may_claim,
-            "may_commit": may_commit,
-            "attempt_deadline_seconds": payload["attempt_deadline_seconds"],
-        }
+        report = _read_translation_file(file_path,root)
+        with _transaction(connection):
+            _verify_stored_plan(connection,config)
+            if connection.execute("SELECT COUNT(*) FROM chunks WHERE state!='DONE'").fetchone()[0]:
+                raise ProjectError("finish translation before review")
+            if stage=="consistency" and connection.execute("SELECT COUNT(*) FROM reviews WHERE stage='chapter' AND status!='DONE'").fetchone()[0]:
+                raise ProjectError("finish chapter review before consistency review")
+            unit = connection.execute("SELECT status FROM reviews WHERE stage=? AND unit_id=?",(stage,unit_id)).fetchone()
+            if unit is None:
+                raise ProjectError(f"unknown review unit: {stage}/{unit_id}")
+            if unit[0]=="DONE":
+                raise ProjectError("review unit already DONE")
+            connection.execute("UPDATE reviews SET status='DONE',report=?,completed_at=? WHERE stage=? AND unit_id=?",(report,_utc_now(),stage,unit_id))
+        return {"command":"review-done","project":str(root),"stage":stage,"unit_id":unit_id,"done":True}
     finally:
         connection.close()
 
 
 def _edit_for(root: Path, chunk_id: str) -> str | None:
-    edits = root / "edits"
-    for suffix in (".txt", ".md", ""):
-        candidate = edits / f"{chunk_id}{suffix}"
-        if candidate.is_file():
-            try:
-                text = _normalise_text(candidate.read_bytes().decode("utf-8")).rstrip()
-            except (OSError, UnicodeDecodeError) as exc:
-                raise ProjectError(f"invalid edit file: {candidate}") from exc
-            if not text:
-                raise ProjectError(f"edit file is empty: {candidate}")
-            return text
+    for suffix in (".txt",".md",""):
+        path = root/"edits"/f"{chunk_id}{suffix}"
+        if path.is_file():
+            return _read_translation_file(str(path))
     return None
-
-
-def _reserve_output_path(
-    connection: sqlite3.Connection, output_dir: Path, root: Path, stem: str
-) -> tuple[str, Path]:
-    """Reserve the next version while holding the SQLite writer lock."""
-    pattern = re.compile(rf"^{re.escape(stem)}\.v(\d+)\.md$")
-    versions = []
-    for candidate in output_dir.iterdir():
-        match = pattern.match(candidate.name)
-        if match:
-            versions.append(int(match.group(1)))
-    reserved = {
-        str(row["output_path"])
-        for row in connection.execute("SELECT output_path FROM builds").fetchall()
-    }
-    version = max(versions, default=0) + 1
-    while True:
-        output_path = output_dir / f"{stem}.v{version:03d}.md"
-        relative_path = str(output_path.relative_to(root))
-        if not output_path.exists() and relative_path not in reserved:
-            build_id = uuid.uuid4().hex
-            connection.execute(
-                "INSERT INTO builds(build_id, output_path, created_at) VALUES (?, ?, ?)",
-                (build_id, relative_path, _utc_now()),
-            )
-            return build_id, output_path
-        version += 1
 
 
 def _command_build(project: str) -> dict[str, Any]:
     root, connection, config = _open_project(project)
     try:
-        rows = connection.execute(
-            """
-            SELECT c.chunk_id, c.source, c.state, t.text
-            FROM chunks c
-            JOIN chapters h ON h.chapter_id = c.chapter_id
-            LEFT JOIN translations t ON t.chunk_id = c.chunk_id
-            ORDER BY h.chapter_number, c.chunk_number
-            """
-        ).fetchall()
-        if not rows or any(row["state"] != "DONE" or row["text"] is None for row in rows):
-            raise ProjectError("cannot build until every chunk is DONE")
-        parts: list[str] = []
-        for row in rows:
-            text = _edit_for(root, str(row["chunk_id"])) or str(row["text"])
-            if text.strip():
-                parts.append(text.rstrip())
-        content = "\n\n".join(parts).rstrip() + "\n"
-        source_name = Path(str(config["source_relpath"])).name
-        stem = Path(source_name).stem
-        output_dir = root / "output"
-        output_dir.mkdir(parents=True, exist_ok=True)
         with _transaction(connection):
-            build_id, output_path = _reserve_output_path(connection, output_dir, root, stem)
-        try:
-            _atomic_write(output_path, content.encode("utf-8"))
-        except BaseException:
-            # A failed write must not permanently consume a version when the
-            # process is still alive to clean up.  A process crash leaves the
-            # reservation as a harmless skipped version.
-            with _transaction(connection):
-                connection.execute("DELETE FROM builds WHERE build_id = ?", (build_id,))
-            raise
-        return {
-            "command": "build",
-            "built": True,
-            "project": str(root),
-            "build_id": build_id,
-            "output_relpath": str(output_path.relative_to(root)),
-            "output": str(output_path),
-            "chunks": len(rows),
-            "edits_applied": sum(1 for row in rows if _edit_for(root, str(row["chunk_id"])) is not None),
-        }
-    finally:
-        connection.close()
-
-
-def _command_retry_failed(project: str) -> dict[str, Any]:
-    root, connection, config = _open_project(project)
-    try:
-        with _transaction(connection):
-            run = _latest_run(connection)
-            if run is None:
-                raise ProjectError("start the project before retrying failed chunks")
-            active = connection.execute("SELECT COUNT(*) FROM attempts WHERE state = 'RUNNING'").fetchone()[0]
-            if active:
-                raise ProjectError("stop or interrupt all active workers before retry-failed")
-            if run["status"] in ("STOPPED", "INTERRUPTED") and run["cleanup_verified_at"] is None:
-                raise ProjectError("confirm cleanup before retry-failed can reset chunks")
-            rows = connection.execute("SELECT chunk_id FROM chunks WHERE state = 'FAILED'").fetchall()
-            if rows and run["status"] == "RUNNING":
-                _stop_run_in_transaction(connection, str(run["run_id"]), "retry-failed requested")
-            for row in rows:
-                connection.execute(
-                    """
-                    UPDATE chunks SET state = 'PENDING', attempts_used = 0, failure_count = 0,
-                        current_attempt_id = NULL, current_worker_id = NULL
-                    WHERE chunk_id = ?
-                    """,
-                    (row["chunk_id"],),
-                )
-            if rows:
-                connection.execute(
-                    "UPDATE chapters SET state = 'PENDING', owner_run_id = NULL, owner_worker_id = NULL WHERE state = 'FAILED'"
-                )
-                connection.execute(
-                    """
-                    UPDATE runs SET status = 'STOPPED', stop_requested = 1, ended_at = ?, cleanup_verified_at = NULL
-                    WHERE run_id = ? AND status IN ('RUNNING', 'STOPPING')
-                    """,
-                    (_utc_now(), run["run_id"]),
-                )
-                if _run_is_current(connection, str(run["run_id"])):
-                    _set_current_run_id(connection, None)
-            _refresh_chapters(connection)
-            current = _run_row(connection, run["run_id"])
-            status = str(current["status"])
-        return {
-            "command": "retry-failed",
-            "project": str(root),
-            "run_id": run["run_id"],
-            "retried": len(rows),
-            "status": status,
-            "requires_new_run": bool(rows),
-            "max_attempts": _config_int(config, "retry", "max_attempts", MAX_ATTEMPTS),
-        }
+            _verify_stored_plan(connection,config)
+            if connection.execute("SELECT COUNT(*) FROM chunks WHERE state!='DONE'").fetchone()[0]:
+                raise ProjectError("cannot build until every chunk is DONE")
+            if connection.execute("SELECT COUNT(*) FROM reviews WHERE status!='DONE'").fetchone()[0]:
+                raise ProjectError("cannot build until chapter and consistency reviews are DONE")
+            rows = connection.execute("SELECT c.chunk_id,t.text FROM chunks c JOIN chapters h ON h.chapter_id=c.chapter_id JOIN translations t ON t.chunk_id=c.chunk_id ORDER BY h.chapter_number,c.chunk_number").fetchall()
+            if not rows:
+                raise ProjectError("no committed translations")
+            parts = [(_edit_for(root,row["chunk_id"]) or row["text"]).rstrip() for row in rows]
+            content = "\n\n".join(parts).rstrip()+"\n"
+            output_dir = root/"output"
+            output_dir.mkdir(exist_ok=True)
+            stem = Path(str(config["source_relpath"])).stem
+            existing = [int(m.group(1)) for file in output_dir.glob(f"{stem}.v*.md") if (m:=re.fullmatch(re.escape(stem)+r"\.v(\d+)\.md",file.name))]
+            version = max(existing,default=0)+1
+            while True:
+                path = output_dir/f"{stem}.v{version:03d}.md"
+                if not path.exists():
+                    break
+                version += 1
+            _atomic_write(path,content.encode("utf-8"))
+            connection.execute("INSERT INTO builds(build_id,output_path,created_at) VALUES (?,?,?)",(uuid.uuid4().hex,str(path.relative_to(root)),_utc_now()))
+        return {"command":"build","built":True,"project":str(root),"output":str(path),"chunks":len(rows),"edits_applied":sum(_edit_for(root,row["chunk_id"]) is not None for row in rows)}
     finally:
         connection.close()
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SQLite state engine for a four-worker book translation pilot")
-    commands = parser.add_subparsers(dest="command", required=True)
-
+    parser = argparse.ArgumentParser(description="Book translation state and fenced commits")
+    commands = parser.add_subparsers(dest="command",required=True)
     plan = commands.add_parser("plan")
     plan.add_argument("source")
-    plan.add_argument("--chunking-version", type=int, choices=(1, 2), default=DEFAULT_CHUNKING_VERSION)
-
+    plan.add_argument("--chunking-version",type=int,choices=(1,2),default=DEFAULT_CHUNKING_VERSION)
     init = commands.add_parser("init")
     init.add_argument("source")
-    init.add_argument("--project", required=True)
-    init.add_argument("--source-language", default="auto")
-    init.add_argument("--target-language", default="zh-CN")
-    init.add_argument("--chunking-version", type=int, choices=(1, 2), default=DEFAULT_CHUNKING_VERSION)
+    init.add_argument("--project",required=True)
+    init.add_argument("--source-language",default="auto")
+    init.add_argument("--target-language",default="zh-CN")
+    init.add_argument("--chunking-version",type=int,choices=(1,2),default=DEFAULT_CHUNKING_VERSION)
     init.add_argument("--expected-source-sha256")
     init.add_argument("--expected-plan-sha256")
-
     start = commands.add_parser("start")
     start.add_argument("project")
-    start.add_argument(
-        "--root-agent-path",
-        default="/root",
-        help="parent path used to form the four expected worker identities (default: /root)",
-    )
-
+    start.add_argument("--root-agent-path",default="/root")
     claim = commands.add_parser("claim")
     claim.add_argument("project")
-    claim.add_argument("--run-id", required=True)
-    claim.add_argument("--worker-id", required=True)
-
+    claim.add_argument("--run-id",required=True)
+    claim.add_argument("--worker-id",required=True)
     commit = commands.add_parser("commit")
     commit.add_argument("project")
-    commit.add_argument("--run-id", required=True)
-    commit.add_argument("--worker-id", required=True)
-    commit.add_argument("--attempt-id", required=True)
-    commit.add_argument("--file", required=True)
-
+    commit.add_argument("--run-id",required=True)
+    commit.add_argument("--worker-id",required=True)
+    commit.add_argument("--attempt-id",required=True)
+    commit.add_argument("--file",required=True)
     fail = commands.add_parser("fail")
     fail.add_argument("project")
-    fail.add_argument("--run-id", required=True)
-    fail.add_argument("--worker-id", required=True)
-    fail.add_argument("--attempt-id", required=True)
-    fail.add_argument("--error", required=True)
-
-    for name in ("stop", "force-stop"):
+    fail.add_argument("--run-id",required=True)
+    fail.add_argument("--worker-id",required=True)
+    fail.add_argument("--attempt-id",required=True)
+    fail.add_argument("--error",required=True)
+    for name in ("stop","force-stop"):
         command = commands.add_parser(name)
         command.add_argument("project")
-        command.add_argument("--run-id", required=True)
-
-    stop_for_root = commands.add_parser("stop-for-root")
-    stop_for_root.add_argument("project")
-    stop_for_root.add_argument("--run-id", required=True)
-    stop_for_root.add_argument("--root-thread-id", required=True)
-
-    cleanup = commands.add_parser("confirm-cleanup")
-    cleanup.add_argument("project")
-    cleanup.add_argument("--run-id", required=True)
-    cleanup.add_argument("--released-worker", action="append", default=[])
-    cleanup.add_argument("--not-spawned-worker", action="append", default=[])
-    cleanup.add_argument("--worker-state", action="append", default=[])
-
-    invalidate = commands.add_parser("invalidate-run")
-    invalidate.add_argument("project")
-    invalidate.add_argument("--run-id", required=True)
-
-    check_run = commands.add_parser("check-run")
-    check_run.add_argument("project")
-    check_run.add_argument("--run-id", required=True)
-
+        command.add_argument("--run-id",required=True)
     interrupt = commands.add_parser("interrupt-worker")
     interrupt.add_argument("project")
-    interrupt.add_argument("--run-id", required=True)
-    interrupt.add_argument("--worker-id", required=True)
-
-    status = commands.add_parser("status")
-    status.add_argument("project")
-
-    build = commands.add_parser("build")
-    build.add_argument("project")
-
-    retry = commands.add_parser("retry-failed")
-    retry.add_argument("project")
+    interrupt.add_argument("--run-id",required=True)
+    interrupt.add_argument("--worker-id",required=True)
+    check = commands.add_parser("check-run")
+    check.add_argument("project")
+    check.add_argument("--run-id",required=True)
+    commands.add_parser("status").add_argument("project")
+    review = commands.add_parser("review-done")
+    review.add_argument("project")
+    review.add_argument("--stage",required=True,choices=("chapter","consistency"))
+    review.add_argument("--unit-id",required=True)
+    review.add_argument("--file",required=True)
+    commands.add_parser("build").add_argument("project")
     return parser
 
 
 def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
-    if args.command == "plan":
-        return _command_plan(args.source, args.chunking_version)
-    if args.command == "init":
-        return _command_init(
-            args.source, args.project, args.target_language, args.source_language,
-            args.chunking_version, args.expected_source_sha256, args.expected_plan_sha256,
-        )
-    if args.command == "start":
-        return _command_start(args.project, args.root_agent_path)
-    if args.command == "claim":
-        return _command_claim(args.project, args.run_id, args.worker_id)
-    if args.command == "commit":
-        return _command_commit(args.project, args.run_id, args.worker_id, args.attempt_id, args.file)
-    if args.command == "fail":
-        return _command_fail(args.project, args.run_id, args.worker_id, args.attempt_id, args.error)
-    if args.command == "stop":
-        return _command_stop(args.project, args.run_id)
-    if args.command == "force-stop":
-        return _command_force_stop(args.project, args.run_id)
-    if args.command == "stop-for-root":
-        return _command_stop_for_root(args.project, args.run_id, args.root_thread_id)
-    if args.command == "confirm-cleanup":
-        return _command_confirm_cleanup(
-            args.project,
-            args.run_id,
-            args.released_worker,
-            args.not_spawned_worker,
-            args.worker_state,
-        )
-    if args.command == "invalidate-run":
-        return _command_invalidate_run(args.project, args.run_id)
-    if args.command == "check-run":
-        return _command_check_run(args.project, args.run_id)
-    if args.command == "interrupt-worker":
-        return _command_interrupt_worker(args.project, args.run_id, args.worker_id)
-    if args.command == "status":
-        return _command_status(args.project)
-    if args.command == "build":
-        return _command_build(args.project)
-    if args.command == "retry-failed":
-        return _command_retry_failed(args.project)
+    if args.command=="plan": return _command_plan(args.source,args.chunking_version)
+    if args.command=="init": return _command_init(args.source,args.project,args.target_language,args.source_language,args.chunking_version,args.expected_source_sha256,args.expected_plan_sha256)
+    if args.command=="start": return _command_start(args.project,args.root_agent_path)
+    if args.command=="claim": return _command_claim(args.project,args.run_id,args.worker_id)
+    if args.command=="commit": return _command_commit(args.project,args.run_id,args.worker_id,args.attempt_id,args.file)
+    if args.command=="fail": return _command_fail(args.project,args.run_id,args.worker_id,args.attempt_id,args.error)
+    if args.command in ("stop","force-stop"): return _command_stop(args.project,args.run_id,args.command)
+    if args.command=="interrupt-worker": return _command_interrupt_worker(args.project,args.run_id,args.worker_id)
+    if args.command=="check-run": return _command_check_run(args.project,args.run_id)
+    if args.command=="status": return _command_status(args.project)
+    if args.command=="review-done": return _command_review_done(args.project,args.stage,args.unit_id,args.file)
+    if args.command=="build": return _command_build(args.project)
     raise ProjectError(f"unknown command: {args.command}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        args = _parser().parse_args(argv)
-        result = _dispatch(args)
-    except (ProjectError, OSError, sqlite3.Error) as exc:
-        print(_dump({"error": str(exc)}), file=sys.stderr)
+        result = _dispatch(_parser().parse_args(argv))
+    except (ProjectError,OSError,sqlite3.Error) as exc:
+        print(_dump({"error":str(exc)}),file=sys.stderr)
         return 2
     print(_dump(result))
     return 0

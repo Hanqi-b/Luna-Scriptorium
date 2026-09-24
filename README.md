@@ -1,22 +1,22 @@
 # Luna Scriptorium
 
-这是一个正在验证中的 Codex 整本书翻译 Skill。当前输入是完整的 UTF-8 Markdown（或 TXT），输出是中文 Markdown；EPUB/PDF 需要先整理为 Markdown，暂不生成 EPUB。
+`$luna-scriptorium 翻译 <book>` 面向整本书。主 agent 自行识别并准备用户给的文件或文件夹，将可读取的正文整理为锁定的 Markdown/TXT 工作单元，再协调固定的四个 GPT-6 Luna Max worker 完成初译、章节审校、全书一致性检查，最后输出中文 Markdown。合理可用的提取和 OCR 方法都失败时，才报告具体阻塞。
 
-翻译分两步准备：先检查原文 Markdown，再自动规划并锁定章节和分块。运行时由主 agent 调度四个 GPT-6 Luna Max 翻译 agent，记录进度以便中断后恢复。Skill 名称是 `$luna-scriptorium`。使用方法和运行约束见 [`luna-scriptorium/SKILL.md`](luna-scriptorium/SKILL.md)；验证范围及限制见 [`VALIDATION.md`](VALIDATION.md)。
+[Skill 使用说明](luna-scriptorium/SKILL.md) · [验证范围](VALIDATION.md)
 
-## 让 Codex 发现 Skill
+## 本地发现
 
-在此仓库根目录执行：
+此仓库的 `luna-scriptorium/` 是 Skill 目录。可用软链接将其加入个人发现目录：
 
 ```bash
 mkdir -p "$HOME/.agents/skills"
 ln -s "$(pwd)/luna-scriptorium" "$HOME/.agents/skills/luna-scriptorium"
 ```
 
-Codex 可自动发现新增 Skill；如果没有显示，重启 Codex。`.codex/hooks.json` 的生命周期 hooks 可提供额外的停止信号，但不是启动翻译的前置条件。仓库中的 `.artifacts/` 是本地实验记录，不会上传到 GitHub。
-
-## 验证
+## 测试
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_runner.py' -q
 ```
+
+本仓库只保存工作单元状态和输出；模型调用、实际格式提取和 host worker 生命周期由 Codex root agent 执行。
