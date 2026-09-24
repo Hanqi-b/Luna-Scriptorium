@@ -1,17 +1,24 @@
-# Luna Scriptorium validation
+# Validation
 
-## Current verification
+## Workflow reliability
 
-Run `python3 -m unittest discover -s tests -p 'test_runner.py' -q`. The synthetic CLI suite checks locked source/plan integrity, marker-free start, four concurrent claims, chapter ownership, numeric SUSPECT flags, structural rejection, attempt/run fencing, stop/resume without cleanup attestation, worker failure isolation, actual review-unit counts, review gates, edits, and final Markdown build. It does **not** make model calls or test a real book.
+Run `python3 -m unittest discover -s tests -p 'test_runner.py' -q`. CI runs the same suite on pushes and pull requests. Tests use synthetic translations and never call a model. The golden mini-book fixture covers chapter detection, chunk order, numeric SUSPECT, context selection, accepted edit provenance, QA recomputation, snapshot/build order, and four target/source configurations.
 
-The runner stores only durable work state. The root inspects and converts the actual input with reasonably available tools; a project starts only after the extracted source is checked and plan-locked. The host must make all four GPT-6 Luna Max identities available before translation starts. Chapter and consistency review use those same identities. Review progress is the count of persisted completed units, not an estimate.
+The suite also covers plan/source integrity, four concurrent claims, chapter ownership, atomic complete-candidate commit, stale run/attempt rejection, force-stop resume, FAILED persistence and explicit targeted retry, raw edit-file rejection, stable full-book snapshot, review gates, and final Markdown output. It proves these runner state transitions on test fixtures; it does not prove host agent termination.
 
-## Lifecycle boundaries
+| Direction | Synthetic workflow | Semantic translation quality |
+| --- | --- | --- |
+| FR → ZH | Tested | Not yet validated for this revision |
+| EN → ZH | Tested | Not yet validated |
+| ZH → EN | Tested | Not yet validated |
+| FR → EN | Tested | Not yet validated |
 
-`stop` atomically makes the run terminal, invalidates current attempts, and returns unfinished chunks to PENDING; DONE chunks remain unchanged. The root then interrupts and observes the four host agents. A later run rejects commits from older run/attempt IDs. A live run is never silently replaced.
+The earlier Candide work is a historical FR→ZH preparation/lifecycle case, not evidence that this revised pipeline produced a reviewed book. A short real-model sample in each direction is the next manual quality check; it should inspect omissions, meaning, register, target-language naturalness, and review corrections. A full real-book run is a separate validation step.
 
-SQLite state does not prove host worker termination. After abrupt root death, the old run remains active until the next root fences it; an in-flight old worker may still finish before that fence. The next root must inspect and interrupt old host identities before reuse. The runner does not claim instant cascade cancellation or a measured orphan lifetime. SIGKILL remains a host limitation. The deleted Desktop hooks are not a lifecycle dependency.
+## Lifecycle boundary
 
-## Scope of evidence
+`stop` atomically invalidates the run and its unfinished attempts; DONE chunks stay DONE. A later run rejects old results. Ordinary `start` does not reset FAILED chunks. Abrupt root death can leave an old host turn running until the next root fences it. The runner's SQLite state is data fencing, not host-worker termination proof; SIGKILL cascade behavior remains a host limitation. No heartbeat, lease, or Desktop hook marker is required for startup.
 
-CLI tests prove state transitions and output assembly using synthetic inputs. Real EPUB/PDF extraction quality, OCR quality, semantic review quality, effective model selection, and physical host worker cleanup require host-level book runs and are **not** proved by these tests. This repository's previous pilot results are historical; do not reinterpret them as validation of the current simplified flow.
+## Input/output boundary
+
+The root handles actual book extraction with bounded available tools. The runner accepts Markdown/TXT work units. Canonical output is Markdown; EPUB reconstruction is optional only after structural verification. EPUB/PDF extraction quality, OCR, reconstructed EPUB integrity, semantic review quality, and effective four-worker model selection are not covered by this synthetic suite.

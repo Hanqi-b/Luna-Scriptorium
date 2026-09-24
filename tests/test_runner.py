@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "luna-scriptorium" / "translate_book.py"
+FIXTURE = ROOT / "tests" / "fixtures" / "mini-book"
+sys.path.insert(0, str(ROOT / "luna-scriptorium"))
+from scriptorium.chunks import select_context
 
 
 class RunnerTests(unittest.TestCase):
@@ -38,9 +42,12 @@ class RunnerTests(unittest.TestCase):
             return json.loads(result.stderr) if result.stderr.startswith("{") else {"error":result.stderr}
         return json.loads(result.stdout)
 
-    def init(self) -> dict:
+    def init(self, target_language: str = "zh-CN", source_language: str = "auto") -> dict:
         plan = self.call("plan", self.source)
-        return self.call("init", self.source, "--project", self.project, "--expected-source-sha256",plan["source_sha256"],"--expected-plan-sha256",plan["plan_sha256"])
+        return self.call("init", self.source, "--project", self.project,
+                         "--source-language", source_language, "--target-language", target_language,
+                         "--expected-source-sha256",plan["source_sha256"],
+                         "--expected-plan-sha256",plan["plan_sha256"])
 
     def start(self) -> str:
         return self.call("start", self.project)["run_id"]
@@ -73,6 +80,8 @@ class RunnerTests(unittest.TestCase):
     def review_all(self) -> None:
         status = self.call("status",self.project)
         for stage in ("chapter","consistency"):
+            if stage == "consistency":
+                self.call("snapshot", self.project)
             for unit in status["reviews"][stage]["units"]:
                 report = self.base / f"{stage}-{unit['unit_id']}.md"
                 report.write_text("已与原文核对；无未解决问题。",encoding="utf-8")
@@ -91,11 +100,11 @@ class RunnerTests(unittest.TestCase):
     def test_init_rejects_changed_source_and_existing_project(self):
         plan = self.call("plan",self.source)
         self.source.write_text("# Changed\n\nText",encoding="utf-8")
-        err = self.call("init",self.source,"--project",self.project,"--expected-source-sha256",plan["source_sha256"],ok=False)
+        err = self.call("init",self.source,"--project",self.project,"--target-language","zh-CN","--expected-source-sha256",plan["source_sha256"],ok=False)
         self.assertIn("source SHA-256 mismatch",err["error"])
         self.assertFalse(self.project.exists())
         self.init()
-        self.assertIn("must be empty",self.call("init",self.source,"--project",self.project,ok=False)["error"])
+        self.assertIn("must be empty",self.call("init",self.source,"--project",self.project,"--target-language","zh-CN",ok=False)["error"])
 
     def test_long_paragraph_plan_preserves_order_and_size(self):
         paragraph = "Longue phrase française. " * 300
@@ -157,6 +166,27 @@ class RunnerTests(unittest.TestCase):
         second = self.claim(run)
         self.assertEqual(first["chapter_id"],second["chapter_id"])
         self.assertNotEqual(first["attempt_id"],second["attempt_id"])
+
+    def test_context_budget_spends_on_nearest_then_restores_book_order(self):
+        newest = [{"chunk_id":"c3","text":"C"*6},
+                  {"chunk_id":"c2","text":"B"*6},
+                  {"chunk_id":"c1","text":"A"*6}]
+        self.assertEqual([row["chunk_id"] for row in select_context(newest,18)],["c1","c2","c3"])
+        limited = select_context(newest,10)
+        self.assertEqual(limited,[{"chunk_id":"c2","text":"B"*4},
+                                  {"chunk_id":"c3","text":"C"*6}])
+        self.assertEqual(select_context(newest,5),[{"chunk_id":"c3","text":"C"*5}])
+
+    def test_claim_context_keeps_latest_complete(self):
+        self.source.write_text("# Chapter\n\n" + "A "*1800 + "\n\n" + "B "*1800 + "\n\n" + "C "*1800,encoding="utf-8")
+        self.init(); run = self.start()
+        first = self.claim(run); self.commit(run,first,"# Title\n\n" + "a"*1800)
+        second = self.claim(run); self.commit(run,second,"b"*1800)
+        third = self.claim(run)
+        self.assertEqual(third["chunk_id"],"ch001_c003")
+        self.assertEqual(third["context"][-1]["chunk_id"],second["chunk_id"])
+        self.assertEqual(third["context"][-1]["text"],"b"*1800)
+        self.assertEqual(len(third["context"][0]["text"]),600)
 
     def test_numeric_mismatch_commits_and_flags(self):
         self.init(); run = self.start(); job = self.claim(run)
@@ -246,7 +276,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(other["chapter_id"],"ch002")
         self.assertEqual(self.call("check-run",self.project,"--run-id",run)["may_claim"],True)
 
-    def test_exhausted_failure_resets_on_new_run_without_redoing_done(self):
+    def test_exhausted_failure_requires_explicit_targeted_retry(self):
         self.init(); run = self.start()
         first = self.claim(run); self.commit(run,first,"# 第一章")
         for number in range(3):
@@ -254,7 +284,10 @@ class RunnerTests(unittest.TestCase):
             result = self.call("fail",self.project,"--run-id",run,"--worker-id","translator_1","--attempt-id",job["attempt_id"],"--error",f"failure {number}")
         self.assertFalse(result["retryable"])
         self.assertEqual(self.call("status",self.project)["chunks"]["states"],{"DONE":1,"FAILED":1})
-        self.call("stop",self.project,"--run-id",run)
+        self.assertEqual(self.call("status",self.project)["run"]["status"],"FAILED")
+        self.assertEqual(self.call("start",self.project)["status"],"NEEDS_RETRY")
+        self.assertEqual(self.call("status",self.project)["chunks"]["states"],{"DONE":1,"FAILED":1})
+        self.call("retry-failed",self.project,"--chunk-id","ch002_c001","--reason","source inspected; retry with revised instructions")
         next_run = self.start()
         self.assertEqual(self.call("status",self.project)["chunks"]["states"],{"DONE":1,"PENDING":1})
         self.assertEqual(self.claim(next_run)["chunk_id"],"ch002_c001")
@@ -281,13 +314,137 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.call("status",self.project)["reviews"]["chapter"]["done"],1)
 
     def test_review_edit_is_in_final_output(self):
-        self.finish_translation(); self.review_all()
-        edit = self.project/"edits"/"ch001_c001.md"; edit.write_text("# 审校后第一章",encoding="utf-8")
+        self.finish_translation()
+        edit = self.base/"edit.md"; edit.write_text("# 审校后第一章\n\n1759 年",encoding="utf-8")
+        report = self.base/"review.md"; report.write_text("Verified against chapter 1 source.",encoding="utf-8")
+        self.call("apply-edit",self.project,"--stage","chapter","--unit-id","ch001",
+                  "--chunk-id","ch001_c001","--file",edit,"--review-file",report)
+        self.call("review-done",self.project,"--stage","chapter","--unit-id","ch001","--file",report)
+        other = self.base/"other.md"; other.write_text("Checked chapter 2.",encoding="utf-8")
+        self.call("review-done",self.project,"--stage","chapter","--unit-id","ch002","--file",other)
+        self.call("snapshot",self.project)
+        self.assertIn("审校后第一章",(self.project/"work"/"current-book.md").read_text(encoding="utf-8"))
+        self.call("review-done",self.project,"--stage","consistency","--unit-id","batch001","--file",other)
         built = self.call("build",self.project)
         output = Path(built["output"]).read_text(encoding="utf-8")
         self.assertIn("审校后第一章",output)
         self.assertIn("译章",output)
         self.assertEqual(built["edits_applied"],1)
+        self.assertEqual(self.call("status",self.project)["qa_flags"],[])
+
+    def test_raw_edit_file_is_ignored(self):
+        self.finish_translation(); self.review_all()
+        legacy = self.project/"edits"; legacy.mkdir()
+        (legacy/"ch001_c001.md").write_text("# unapproved replacement",encoding="utf-8")
+        output = Path(self.call("build",self.project)["output"]).read_text(encoding="utf-8")
+        self.assertNotIn("unapproved replacement",output)
+
+    def test_apply_edit_requires_provenance_scope_and_structure(self):
+        self.finish_translation()
+        report = self.base/"report.md"; report.write_text("Checked against source",encoding="utf-8")
+        edit = self.base/"edit.md"; edit.write_text("# Corrected 1759",encoding="utf-8")
+        args = ("apply-edit",self.project,"--stage","chapter","--unit-id","ch001",
+                "--chunk-id","ch001_c001","--file",edit,"--review-file",report)
+        wrong = list(args); wrong[5] = "ch002"
+        self.assertIn("outside",self.call(*wrong,ok=False)["error"])
+        edit.write_text("Heading marker missing 1759",encoding="utf-8")
+        self.assertIn("heading marker",self.call(*args,ok=False)["error"])
+        edit.write_text("# Corrected 1759",encoding="utf-8")
+        result = self.call(*args)
+        self.assertEqual(result["edit_sha256"],hashlib.sha256(edit.read_bytes()).hexdigest())
+        with sqlite3.connect(self.project/"state.sqlite") as db:
+            stored = db.execute("SELECT stage,review_unit_id,source_review_hash FROM accepted_edits WHERE chunk_id='ch001_c001'").fetchone()
+        self.assertEqual(stored,("chapter","ch001",hashlib.sha256(report.read_bytes()).hexdigest()))
+        different = self.base/"different.md"; different.write_text("Unrelated report",encoding="utf-8")
+        self.assertIn("provenance",self.call("review-done",self.project,"--stage","chapter","--unit-id","ch001","--file",different,ok=False)["error"])
+        self.call("review-done",self.project,"--stage","chapter","--unit-id","ch001","--file",report)
+
+    def test_apply_edit_recomputes_new_numeric_flag(self):
+        self.init(); run = self.start()
+        first = self.claim(run); self.commit(run,first,"# 译章\n\n1759")
+        second = self.claim(run); self.commit(run,second,"# 译章")
+        self.assertEqual(self.call("status",self.project)["qa_flags"],[])
+        report = self.base/"report.md"; report.write_text("Checked",encoding="utf-8")
+        edit = self.base/"edit.md"; edit.write_text("# 标题；年份删去",encoding="utf-8")
+        result = self.call("apply-edit",self.project,"--stage","chapter","--unit-id","ch001",
+                           "--chunk-id","ch001_c001","--file",edit,"--review-file",report)
+        self.assertEqual(result["suspect_missing_numbers"],["1759"])
+        self.assertEqual(self.call("status",self.project)["qa_flags"][0]["details"],"1759")
+
+    def test_consistency_requires_intact_global_snapshot(self):
+        self.finish_translation()
+        report = self.base/"report.md"; report.write_text("Checked",encoding="utf-8")
+        for unit in ("ch001","ch002"):
+            self.call("review-done",self.project,"--stage","chapter","--unit-id",unit,"--file",report)
+        self.assertIn("snapshot",self.call("review-done",self.project,"--stage","consistency","--unit-id","batch001","--file",report,ok=False)["error"])
+        snapshot = self.call("snapshot",self.project)
+        self.assertTrue(Path(snapshot["output"]).is_file())
+        Path(snapshot["output"]).write_text("tampered",encoding="utf-8")
+        self.assertIn("intact",self.call("review-done",self.project,"--stage","consistency","--unit-id","batch001","--file",report,ok=False)["error"])
+
+    def test_consistency_snapshot_stays_fixed_after_local_edit(self):
+        self.finish_translation()
+        report = self.base/"report.md"; report.write_text("Checked",encoding="utf-8")
+        for unit in ("ch001","ch002"):
+            self.call("review-done",self.project,"--stage","chapter","--unit-id",unit,"--file",report)
+        first = self.call("snapshot",self.project)
+        baseline = Path(first["output"]).read_bytes()
+        edit = self.base/"edit.md"; edit.write_text("# Final chapter title",encoding="utf-8")
+        self.call("apply-edit",self.project,"--stage","consistency","--unit-id","batch001",
+                  "--chunk-id","ch002_c001","--file",edit,"--review-file",report)
+        second = self.call("snapshot",self.project)
+        self.assertTrue(second["existing"])
+        self.assertEqual(Path(second["output"]).read_bytes(),baseline)
+        self.call("review-done",self.project,"--stage","consistency","--unit-id","batch001","--file",report)
+        self.assertIn("Final chapter title",Path(self.call("build",self.project)["output"]).read_text(encoding="utf-8"))
+
+    def test_accepted_edit_hash_checked_during_build(self):
+        self.finish_translation()
+        report = self.base/"report.md"; report.write_text("Checked",encoding="utf-8")
+        edit = self.base/"edit.md"; edit.write_text("# Revised 1759",encoding="utf-8")
+        self.call("apply-edit",self.project,"--stage","chapter","--unit-id","ch001",
+                  "--chunk-id","ch001_c001","--file",edit,"--review-file",report)
+        for unit in ("ch001","ch002"):
+            self.call("review-done",self.project,"--stage","chapter","--unit-id",unit,"--file",report)
+        self.call("snapshot",self.project)
+        self.call("review-done",self.project,"--stage","consistency","--unit-id","batch001","--file",report)
+        with sqlite3.connect(self.project/"state.sqlite") as db:
+            db.execute("UPDATE accepted_edits SET text='# tampered' WHERE chunk_id='ch001_c001'")
+        self.assertIn("accepted edit integrity",self.call("build",self.project,ok=False)["error"])
+
+    def test_existing_project_adds_accepted_edit_table(self):
+        self.init()
+        with sqlite3.connect(self.project/"state.sqlite") as db:
+            db.execute("DROP TABLE accepted_edits")
+        status = self.call("status",self.project)
+        self.assertEqual(status["accepted_edit_count"],0)
+        self.assertEqual(status["target_language"],"zh-CN")
+
+    def test_multilingual_golden_fixture_workflow(self):
+        expected = json.loads((FIXTURE/"expected-structure.json").read_text(encoding="utf-8"))
+        matrix = (("fr","zh-CN","source.md"),("en","zh-CN","source.en.md"),
+                  ("zh-CN","en","source.zh.md"),("fr","en","source.md"))
+        for index,(source_language,target_language,filename) in enumerate(matrix):
+            with self.subTest(source_language=source_language,target_language=target_language):
+                self.source = self.base/f"book-{index}.md"
+                self.source.write_bytes((FIXTURE/filename).read_bytes())
+                self.project = self.base/f"project-{index}"
+                plan = self.call("plan",self.source)
+                self.assertEqual((plan["chapters"],plan["chunks"]),(expected["chapters"],expected["chunks"]))
+                self.init(target_language,source_language)
+                run = self.start()
+                first = self.claim(run)
+                self.assertEqual(first["chunk_id"],expected["chunk_order"][0])
+                self.assertEqual((first["source_language"],first["target_language"]),(source_language,target_language))
+                incomplete = "# 译章" if target_language=="zh-CN" else "# Translated Chapter"
+                flagged = self.commit(run,first,incomplete)
+                self.assertCountEqual(flagged["suspect_missing_numbers"],expected["numbers_in_first_chunk"])
+                second = self.claim(run)
+                self.assertEqual(second["chunk_id"],expected["chunk_order"][1])
+                self.commit(run,second,incomplete)
+                self.review_all()
+                output = Path(self.call("build",self.project)["output"]).read_text(encoding="utf-8")
+                self.assertEqual(output.count(incomplete),2)
 
     def test_complete_project_does_not_create_new_run(self):
         run = self.finish_translation()

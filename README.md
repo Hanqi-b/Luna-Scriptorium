@@ -1,22 +1,50 @@
 # Luna Scriptorium
 
-`$luna-scriptorium 翻译 <book>` 面向整本书。主 agent 自行识别并准备用户给的文件或文件夹，将可读取的正文整理为锁定的 Markdown/TXT 工作单元，再协调固定的四个 GPT-6 Luna Max worker 完成初译、章节审校、全书一致性检查，最后输出中文 Markdown。合理可用的提取和 OCR 方法都失败时，才报告具体阻塞。
+Luna Scriptorium is a resumable whole-book translation workflow. A Codex root agent prepares the input, then supervises four fixed GPT-6 Luna Max workers through translation, chapter review, whole-book consistency review, and final output. The source and target may be different languages; the runner has no Chinese-only path.
 
-[Skill 使用说明](luna-scriptorium/SKILL.md) · [验证范围](VALIDATION.md)
+## Quick start
 
-## 本地发现
+In Codex, invoke:
 
-此仓库的 `luna-scriptorium/` 是 Skill 目录。可用软链接将其加入个人发现目录：
-
-```bash
-mkdir -p "$HOME/.agents/skills"
-ln -s "$(pwd)/luna-scriptorium" "$HOME/.agents/skills/luna-scriptorium"
+```text
+$luna-scriptorium 翻译 <book> 到 <target language>
 ```
 
-## 测试
+The user provides the book and target language once. The root detects the source language, prepares and checks the text, locks chapters/chunks, starts the four-worker pool, manages retries and review, and returns the output path. `状态` asks for progress; `停止` fences the current run. Normal internal stages need no further confirmation. See [SKILL.md](luna-scriptorium/SKILL.md) for the operational contract.
+
+## Input and languages
+
+Give the root a file or folder: EPUB, PDF, DOCX, HTML, TXT, Markdown, and other reasonably readable books are handled using tools available in the environment. The root makes a bounded extraction/OCR attempt and reports the exact blockage if it cannot reliably obtain the body text. The state runner takes stable UTF-8 Markdown/TXT; it is deliberately not a format-adapter framework.
+
+`source_language` can be detected by the root or left as `auto`; `target_language` is set from the user's request. The same runner accepts FR→ZH, EN→ZH, ZH→EN, FR→EN, and other directions without separate language-pair code. This is a workflow capability, not a claim of publication-quality translation for every pair.
+
+## Workflow and output
+
+1. Inspect input and prepare faithful ordered source text; lock a verified chapter/chunk plan.
+2. Start exactly four GPT-6 Luna Max workers. Each turn translates one chunk; DONE chunks survive stop and resume. Old run/attempt results cannot overwrite later state.
+3. Reuse the same workers for chapter review. Corrections enter only through `apply-edit`, which checks scope, structure, provenance, hashes, and current QA.
+4. Create `work/current-book.md` from accepted chapter edits. Reuse the same workers for consistency review with a stable full-book view and local batch responsibility.
+5. Build the canonical translated **Markdown** file in `output/`. A reconstructed EPUB is optional when the root can preserve and verify its structure.
+
+Progress reports use actual DONE/total chunks, chapter review units, and consistency units. Numeric differences are flagged for human-style model review; they do not discard a complete chunk. A FAILED chunk remains FAILED across ordinary starts until the root diagnoses it and explicitly retries that chunk.
+
+## Limits and validation
+
+SQLite fencing protects committed state, but it cannot itself terminate a host worker after abrupt root death. The next root must fence the old run and clear observable old turns before reuse. Extraction, OCR, EPUB reconstruction, effective host model selection, and translation quality need real host validation. [VALIDATION.md](VALIDATION.md) separates tested workflow mechanics from unverified language-pair quality.
+
+Run the synthetic suite locally:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_runner.py' -q
 ```
 
-本仓库只保存工作单元状态和输出；模型调用、实际格式提取和 host worker 生命周期由 Codex root agent 执行。
+GitHub Actions runs the same tests on pushes and pull requests. The license is [MIT](LICENSE).
+
+## Local Skill discovery
+
+The repository's `luna-scriptorium/` directory is the Skill. Link it into the personal discovery directory if needed:
+
+```bash
+mkdir -p "$HOME/.agents/skills"
+ln -s "$(pwd)/luna-scriptorium" "$HOME/.agents/skills/luna-scriptorium"
+```
