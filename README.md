@@ -22,8 +22,8 @@ Give the root a file or folder: EPUB, PDF, DOCX, HTML, TXT, Markdown, and other 
 
 1. Inspect input and prepare faithful ordered source text; lock a verified chapter/chunk plan.
 2. Start exactly four GPT-6 Luna Max workers. Each turn translates one chunk; DONE chunks survive stop and resume. Old run/attempt results cannot overwrite later state.
-3. Reuse the same workers for chapter review. Corrections enter only through `apply-edit`, which checks scope, structure, provenance, hashes, and current QA.
-4. Create `work/current-book.md` from accepted chapter edits. Reuse the same workers for consistency review with a stable full-book view and local batch responsibility.
+3. Reuse the same workers for chapter review. Workers propose corrections; the root prepares candidate files, submits each through `apply-edit`, then marks the chapter `review-done` after acceptance. Direct files in `edits/` never enter the final book.
+4. Create `work/current-book.md` from accepted chapter edits. Reuse the same workers for consistency review with a stable full-book view and local batch responsibility. Consistency corrections follow the same candidate → `apply-edit` → `review-done` order.
 5. Build the canonical translated **Markdown** file in `output/`. A reconstructed EPUB is optional when the root can preserve and verify its structure.
 
 Progress reports use actual DONE/total chunks, chapter review units, and consistency units. Numeric differences are flagged for human-style model review; they do not discard a complete chunk. A FAILED chunk remains FAILED across ordinary starts until the root diagnoses it and explicitly retries that chunk.

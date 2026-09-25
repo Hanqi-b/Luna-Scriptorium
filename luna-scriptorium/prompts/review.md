@@ -6,4 +6,4 @@ The root assigns one chapter or consistency batch to this same GPT-6 Luna Max wo
 
 **Consistency review:** Read the stable `work/current-book.md` snapshot of the entire translated book. Check cross-chapter names, places, recurring terms, chapter titles, dates, tone, and register. You can see the whole book, but propose changes only to chunk IDs in your assigned four-chapter batch. Apply target-language punctuation, quotation, and naming conventions according to that language.
 
-Return a concise report containing the unit ID, checks made, unresolved issues, and exact replacement text for each proposed chunk edit. The root passes this report through `apply-edit` and `review-done` after your turn finishes.
+Return a concise report containing the unit ID, checks made, unresolved issues, and exact replacement text for each proposed chunk edit. After your turn finishes, the root prepares each candidate edit, submits it with `apply-edit`, and marks the unit `review-done` only after every proposed edit is accepted. Do not write directly to `edits/`; those files are not accepted edits.

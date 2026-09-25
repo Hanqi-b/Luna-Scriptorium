@@ -1,11 +1,11 @@
 ---
 name: luna-scriptorium
-description: Translate a whole book between languages with four fixed GPT-6 Luna Max Codex workers. The root prepares the input, supervises translation and review, and delivers a checked Markdown book with resumable state.
+description: Multilingual whole-book translation between a root-identified source language and a user-selected target language, using four fixed GPT-6 Luna Max Codex workers with review and resumable Markdown output.
 ---
 
 # Luna Scriptorium
 
-`$luna-scriptorium 翻译 <book> 到 <target language>` authorizes the complete workflow. The root identifies the source language automatically unless the user specified it. If the target is missing and cannot be inferred, ask for that goal; never ask for internal lifecycle, conversion, worker, chunk, review, or build confirmation. `状态` and `停止` are optional user commands.
+`$luna-scriptorium 翻译 <book> 到 <target language>` authorizes the complete multilingual whole-book workflow. By default, the root identifies the source language automatically; a user-specified source language takes precedence. If the target is missing and cannot be inferred, ask for that goal; never ask for internal lifecycle, conversion, worker, chunk, review, or build confirmation. `状态` and `停止` are optional user commands.
 
 ## Prepare and lock
 
@@ -23,9 +23,9 @@ A numeric discrepancy commits with a SUSPECT flag for review. Empty/structurally
 
 ## Review, snapshot, and output
 
-After all chunks are DONE, assign chapter review units to the **same four workers** using [prompts/review.md](prompts/review.md). Workers propose exact chunk edits and a report; the root alone applies them with `apply-edit PROJECT --stage chapter --unit-id chNNN --chunk-id CHUNK --file CANDIDATE --review-file REPORT`, then calls `review-done PROJECT --stage chapter --unit-id chNNN --file REPORT`. The runner checks the DONE chunk, unit scope, structure, review provenance, and current numeric QA; it stores accepted text and hash atomically. A file merely appearing in `edits/` never changes output.
+After all chunks are DONE, assign chapter review units to the **same four workers** using [prompts/review.md](prompts/review.md). For each proposed correction, the worker returns exact replacement text and a report; the root prepares a UTF-8 candidate edit file, calls `apply-edit PROJECT --stage chapter --unit-id chNNN --chunk-id CHUNK --file CANDIDATE --review-file REPORT`, and checks that it was accepted. Only after all proposed edits for that chapter succeed does the root call `review-done PROJECT --stage chapter --unit-id chNNN --file REPORT`. If no edit is needed, the root records the completed review directly with `review-done`. The runner checks the DONE chunk, unit scope, structure, review provenance, and current numeric QA; it stores accepted text and hash atomically. A file merely appearing in `edits/` never changes output.
 
-After every chapter unit is DONE, call `snapshot PROJECT`. This creates `work/current-book.md` from the effective translation, including accepted chapter edits. All four consistency workers read this stable full-book view, while each proposes changes only within its assigned batch: `batch001` covers chapters 1–4, `batch002` covers 5–8, etc. The root accepts valid proposals through `apply-edit ... --stage consistency`, then calls `review-done ... --stage consistency` with the matching report. These are ordinary followups to the existing worker identities, not a second scheduler.
+After every chapter unit is DONE, call `snapshot PROJECT`. This creates `work/current-book.md` from the effective translation, including accepted chapter edits. All four consistency workers read this stable full-book view, while each proposes changes only within its assigned batch: `batch001` covers chapters 1–4, `batch002` covers 5–8, etc. For each proposed correction, the root prepares a UTF-8 candidate edit file, calls `apply-edit PROJECT --stage consistency --unit-id batchNNN --chunk-id CHUNK --file CANDIDATE --review-file REPORT`, and checks acceptance. Only then does it call `review-done PROJECT --stage consistency --unit-id batchNNN --file REPORT` with the matching report; if no edit is needed, it calls `review-done` directly. These are ordinary followups to the existing worker identities, not a second scheduler.
 
 When all review units are DONE, run `build PROJECT`. The canonical text output is Markdown assembled from original committed translations plus **runner-accepted** edits. Verify completeness, chapter order, source/target languages, output existence, and unresolved QA flags. For EPUB input, reconstruct an EPUB only when the retained spine/assets can be preserved and the result verified; provide it alongside Markdown. Report the final path and short QA summary. Release the four workers and confirm no active turns remain.
 
